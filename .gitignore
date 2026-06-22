@@ -1,0 +1,24 @@
+# 含真实阿里云凭证，禁止提交。请复制 scripts/config.example.py 为 scripts/config.py 后填入凭证。
+scripts/config.py
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.python-version
+
+# 测试 / 缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 操作系统 / 编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
