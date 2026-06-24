@@ -274,6 +274,7 @@ def check_partition_filters(odps, sql):
 # ODPS 连接 & 取数
 # ---------------------------------------------------------------------------
 def get_odps() -> ODPS:
+    config.require_credentials()
     return ODPS(
         access_id=config.ACCESS_ID,
         secret_access_key=config.SECRET,

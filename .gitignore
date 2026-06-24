@@ -16,6 +16,13 @@ env/
 .mypy_cache/
 .ruff_cache/
 
+# 本地取数 / 导出产物（脚本 --save 的输出，非源码）
+*.xlsx
+*.csv
+
+# 打包产物
+*.skill
+
 # 操作系统 / 编辑器
 .DS_Store
 Thumbs.db

@@ -12,12 +12,12 @@ import os
 ACCESS_ID = (
     os.environ.get("ALIYUN_ACCESS_KEY_ID")
     or os.environ.get("ODPS_ACCESS_ID")
-    or ""  # 在本地 config.py 中填入，或用环境变量提供
+    or ""  # 留空：密钥只走环境变量，不要写明文进 config.py
 )
 SECRET = (
     os.environ.get("ALIYUN_ACCESS_KEY_SECRET")
     or os.environ.get("ODPS_SECRET")
-    or ""  # 在本地 config.py 中填入，或用环境变量提供
+    or ""  # 留空：密钥只走环境变量，不要写明文进 config.py
 )
 
 # ODPS / MaxCompute（把 <region> 换成你的地域，如 cn-shanghai；内网环境用对应的 VPC 端点）
