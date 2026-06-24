@@ -90,52 +90,21 @@ python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --save 
 
 > **任务含多张 tmp 中间表、要端到端验证产出时**，别人肉把链路重写成 WITH——用 `scripts/build_validation_sql.py inline <任务.sql> --var bizdate=<分区>` 把 `DROP/CREATE TABLE AS/INSERT OVERWRITE tmp` 链路机械转成**单条只读 WITH**（再喂给 `mc_query.py sql -f`）；它会标出「无法干净转写」的可疑片段（同名 tmp 多写、动态分区、引用尚未定义的 tmp=疑似依赖顺序倒置）。改前/改后对照用 `compare` 子命令（FULL OUTER JOIN on 唯一键）。详见脚本 `--help`。**生成物只是文本，仍走 `mc_query.py` 的只读校验，不破坏只读不变量。**
 
-### 拉取历史版本代码
+### 进阶：历史版本 / 数据集成同步任务（详见 references）
 
-当用户要看任务的**历史版本**（「上一版长什么样」「两周前那版的代码」「最近两次提交改了什么」「这次回归是哪一版引入的」）时，用同一个 `fetch_task_sql.py` 的版本子命令——它走 DataWorks 的文件版本历史：
+同一个 `fetch_task_sql.py` 还覆盖两类**条件性**进阶用法，命令与读法收在 [references/fetch_task_sql.md](references/fetch_task_sql.md)，碰到对应场景再去读：
 
-```bash
-# 1) 先列出该任务所有历史版本（版本号 / 提交时间 / 提交人 / 状态 / 是否当前生产版★ / 变更类型 / 字符数 / 备注）
-python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --list-versions
+- **历史版本**：用户要看「上一版 / 两周前那版 / 最近改了什么 / 哪版引入回归」时，用 `--list-versions` 看时间线、`--get-version N` 取某版、`--diff A B` 看两版改动。
+- **数据集成离线同步任务**：拉回的可能不是 SQL 而是 DI 同步节点（`to_holo_..._di`，多为 MaxCompute→Hologres）；脚本会自动识别并解读出源/目标/写入模式/列映射，重点看列是否按位置错位。目标表在 Hologres（跨引擎），需改用 `holo-query` 核对。
 
-# 2) 按版本号取某一历史版本的完整 SQL（可配 --save 落盘）
-python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --get-version 7
-python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --get-version 7 --save v7.sql
-
-# 3) 对比两个历史版本，看具体改了哪些行（输出 unified diff）
-python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --diff 6 7
-```
-
-典型用法：先 `--list-versions` 看清有哪些版本、哪版是当前生产版（标 ★），再用 `--get-version N` 取目标版代码，或 `--diff A B` 定位两版之间的改动。版本号不存在会以退出码 4 友好报错——回到 `--list-versions` 核对可用版本号。（历史版本代码同样含写语句，只读不执行，见上 ⚠。）
-
-### 拉取数据集成（离线同步）任务
-
-DataWorks「数据开发」里除了 ODPS SQL 任务，还有**数据集成离线同步节点**（DI 节点，目录常在 `.../folderDi`，命名多为 `to_holo_..._di`），作用是把一张表的数据同步到另一个存储（最常见是 MaxCompute → Hologres）。`fetch_task_sql.py` 用同一条命令就能拉——它会**自动识别**这类任务，解读成只含同步任务真正关心的四样的精简摘要：**源、目标、写入模式、列映射**（运行设置、原始 DataX JSON 等次要信息刻意不输出）：
-
-```bash
-python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py to_holo_ads_shop_opn_patrol_task_shop_nature_di
-```
-
-摘要怎么读：
-- **源 (Reader)**：从哪张表、哪个分区（如 `ds=${bizdate}`）、哪些列读。
-- **目标 (Writer)**：写到哪个库.表、**写入模式**（holo 的 `conflictMode`：`update`=按主键更新 / `replace`=整行替换；`truncate` 是否清空重写）。
-- **列映射审查（按位置 reader[i] ↔ writer[i]）**：离线同步的列是**按位置一一对应**的，不是按名字——摘要把两边列逐行对齐，重点看告警级别：
-  - `⚠ 列数不一致` → 几乎一定是 bug：按位置映射会整体错位，要逐列核对。
-  - `ℹ 有 N 处列名不同` → 多半是有意改名（源 `issue_count` 写到目标 `issue_cnt`），但仍要人工扫一眼，确认不是从某一行起发生整体错位。
-  - `✓ 完全同名对应` → 放心。
-
-要不要进一步用数据佐证：
-- **源表**在 MaxCompute，可直接用 `mc_query.py` 验证——最新分区有没有数据、行数多少、某列分布，确认同步源头正常。这部分仍是本 skill 的主场。
-- **目标表**多在 Hologres（跨引擎）：本 skill 只读 MaxCompute、不连 Holo；目标侧行数核对/源目标比对请改用 `holo-query` skill。
-
-查找提示：DI 任务请用**任务名**（`to_holo_..._di`）查，别用 Holo 目标表名反查——按产出表反查只认 MaxCompute 表，查不到 Holo 目标。（拉回的同步配置同样只读不执行，见上 ⚠。）
+（两类拉回的代码/配置同样**只读不执行**，见上 ⚠。）
 
 ## 审查既有 SQL 任务
 
 读代码能直接定论的 bug 就直接下结论；但很多疑点（是不是真有重复、某字段是不是真恒为 NULL、一个流程是不是真对多文件）光看代码只是「怀疑」，必须落到线上数据才算数。标准流程是「分析器拆 → 验证器并行查 → 你合并」：
 
 1. **拉取 + 分析（任务代码分析器）。** 起一个 [task-analyzer](agents/task-analyzer.md) 子代理：只给了任务名就让它先 `fetch_task_sql.py` 拉代码，通读后回传结构化清单——「读代码即可定论的 bug」与「需数据佐证的疑点」分开，后者每条已写成自包含的验证问题。任务很短、或用户已贴出 SQL 时，你也可以自己读、自己列疑点，不强求起子代理。
-   - 若怀疑「问题/回归是最近一次改动引入的」，先 `fetch_task_sql.py <表> --list-versions` 看改动时间线、再 `--diff <旧版> <新版>` 定位是哪一版改了哪几行（见上「拉取历史版本代码」，这步你自己内联跑即可）。
+   - 若怀疑「问题/回归是最近一次改动引入的」，先 `fetch_task_sql.py <表> --list-versions` 看改动时间线、再 `--diff <旧版> <新版>` 定位是哪一版改了哪几行（命令见 [references/fetch_task_sql.md](references/fetch_task_sql.md)，这步你自己内联跑即可）。
 2. **并行取数证实/证伪（验证器）。** 把上一步「需数据佐证的疑点」**在同一条消息里并行**交给多个 [verifier](agents/verifier.md) 子代理，每个查一条（务必带分区过滤）。常见疑点对应的查法：
    - 字段恒为 NULL → 查非空占比：`SELECT COUNT(*) total, COUNT(request_status) non_null FROM 表 WHERE ds=MAX_PT('表') AND oa_name='...'`。
    - 一个 `request_id` 对多 `file_id` 导致窗口串值 → `SELECT request_id, COUNT(DISTINCT file_id) c FROM 源表 WHERE ds=... GROUP BY request_id HAVING c>1 LIMIT 20`。
@@ -150,7 +119,7 @@ python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py to_holo_ads_sho
 
 用户说「帮我把这个任务改成 X」（改唯一键/粒度、加去重、改 JOIN、增删字段、调口径……）时，最容易犯的错是**只在代码层闭眼改写**——既没先确认要改的前提是否真的成立，也没在改完后用数据验证结果。后果是可能在解决一个并不存在的问题、漏掉真正的膨胀点，或方案依赖了一个不成立的假设。改 SQL 同样是一次取数排查的机会，别浪费。流程是「分析器拆 → 验证器并行查 → 你改 → 验证器自检 → 你合并」：
 
-> 当用户的改法是「回退到之前某版」「在上一版基础上改」「参照历史版本」时，先用 `fetch_task_sql.py <表> --list-versions` / `--get-version N` 取到那一版代码作为基线，再动手（见上「拉取历史版本代码」）。
+> 当用户的改法是「回退到之前某版」「在上一版基础上改」「参照历史版本」时，先用 `fetch_task_sql.py <表> --list-versions` / `--get-version N` 取到那一版代码作为基线，再动手（命令见 [references/fetch_task_sql.md](references/fetch_task_sql.md)）。
 
 1. **拉取 + 分析（任务代码分析器）。** 起 [task-analyzer](agents/task-analyzer.md)（场景填 `修改(C)` 并附「要改成什么」），让它回传两份清单：**改动前需验证的前提** 和 **改动后需自检的断言**——都已写成可直接交给验证器的形式。
    - **改造意图本身有歧义就先用提问框问清，再 dispatch 验证器。** 修改类诉求最容易藏着「取决于用户」的取舍：唯一键边界（含不含 `node_oper`）、按哪个时间字段取最早、并列/NULL 如何处理。这些数据判不了，硬挑一个会让后面整轮验证都架在错误的改法上。若 task-analyzer 回传了「需用户澄清的决策点」，或你自己一眼看出这种分叉，先用 `AskUserQuestion` 带选项（连同已查到的字段格式/重复规模）问清，拿到答复再往下。

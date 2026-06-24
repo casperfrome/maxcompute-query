@@ -20,7 +20,9 @@ scripts/
   fetch_task_sql.py         从 DataWorks 拉取任务 SQL / 历史版本，并解读数据集成离线同步任务
   di_task.py                数据集成同步配置解析（源/目标/写入模式/列映射审查）
   build_validation_sql.py   生成校验 SQL
-references/maxcompute_sql.md  MaxCompute SQL 参考
+references/
+  maxcompute_sql.md         MaxCompute SQL 参考
+  fetch_task_sql.md         拉历史版本 / 读数据集成同步任务（进阶用法）
 agents/                     子代理（任务分析、校验）
 evals/                      评测用例
 ```
