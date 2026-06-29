@@ -1,6 +1,6 @@
 ---
 name: maxcompute-query
-description: 通过辅助脚本探查表结构、编写并执行 MaxCompute (ODPS) 只读 SQL 来排查数仓/数据问题，并用真实数据为结论佐证。三类场景都要触发，且即使用户没明说「写 SQL / 查数据 / 验证一下」也要主动取数，而不是只静态阅读或闭眼改写：(1) 取数排查——任何需查数仓才能回答的诉求（核对指标/数量、看某表某字段的数据情况、统计分布/占比/Top N、查空值或脏数据、对某现象取数验证）；(2) 审查既有 SQL——给一段 MaxCompute/ODPS 任务或 .sql/.txt，找逻辑漏洞、bug、口径错误、解释结果为何不对（常见可疑点：建表/依赖顺序读到旧数据、窗口 PARTITION BY 粒度错、JOIN 缺键膨胀、缺分区过滤、NULL/重复/口径偏差，多能用线上数据证实或证伪）；(3) 修改/重构既有 SQL——改唯一键/粒度、加去重、改 JOIN、增删字段、调过滤，改前用真实数据核实前提（是否真会膨胀、是否真有重复），改后用数据验证结果（新唯一键是否真唯一、行数增减是否合预期）。只给表名/任务名而没贴 SQL（如「看看 dws_xxx 这个任务有没有问题」「帮我改下这个任务」）也要触发，先用 fetch_task_sql.py 按产出表名自动从 DataWorks 拉取线上 SQL 再审查/修改，别反过来让用户贴。拉回的可能不是 ODPS SQL 而是数据集成离线同步任务（DataWorks DI 节点，命名多为 to_holo_..._di，常见 MaxCompute→Hologres），脚本会自动识别并解读出「源→目标、写入模式、reader/writer 列按位置映射对照」；用户问「这个同步任务把哪张表同步到哪 / 列有没有错位 / 这张 Holo 表从哪同步来」时同样触发。用户提到任务的历史版本（上一版、版本对比、最近改了什么）时，用 --list-versions / --get-version N / --diff A B 拉取。涉及 ODPS、MaxCompute、ds 分区表、MAX_PT、dwd/dws/ads 等数仓表名/特征时尤其适用。边界（不触发）：纯 SQL 语法/概念讲解、与线上数仓无关的纯方言互转（如业务库 MySQL↔PostgreSQL 改写、无可连线上表）、非 SQL 的代码 review。
+description: 通过辅助脚本探查表结构、编写并执行 MaxCompute (ODPS) 只读 SQL 来排查数仓/数据问题，并用真实数据为结论佐证。三类场景都要触发，且即使用户没明说「写 SQL / 查数据 / 验证一下」也要主动取数，而不是只静态阅读或闭眼改写：(1) 取数排查——任何需查数仓才能回答的诉求（核对指标/数量、看某表某字段的数据情况、统计分布/占比/Top N、查空值或脏数据、对某现象取数验证）；(2) 审查既有 SQL——给一段 MaxCompute/ODPS 任务或 .sql/.txt，找逻辑漏洞、bug、口径错误、解释结果为何不对（常见可疑点：建表/依赖顺序读到旧数据、窗口 PARTITION BY 粒度错、JOIN 缺键膨胀、缺分区过滤、NULL/重复/口径偏差，多能用线上数据证实或证伪）；(3) 修改/重构既有 SQL——改唯一键/粒度、加去重、改 JOIN、增删字段、调过滤，改前用真实数据核实前提（是否真会膨胀、是否真有重复），改后用数据验证结果（新唯一键是否真唯一、行数增减是否合预期）。只给表名/任务名而没贴 SQL（如「看看 dws_xxx 这个任务有没有问题」「帮我改下这个任务」）也要触发，先用 fetch_task_sql.py 按产出表名自动从 DataWorks 拉取线上 SQL 再审查/修改，别反过来让用户贴。拉回的可能不是 ODPS SQL 而是数据集成离线同步任务（DataWorks DI 节点，命名多为 to_holo_..._di，常见 MaxCompute→Hologres），脚本会自动识别并解读出「源→目标、写入模式、reader/writer 列按位置映射对照」；用户问「这个同步任务把哪张表同步到哪 / 列有没有错位 / 这张 Holo 表从哪同步来」时同样触发。用户提到任务的历史版本（上一版、版本对比、最近改了什么）时，用 --list-versions / --get-version N / --diff A B 拉取。审查任务 SQL 时遇到非内建函数调用（自定义函数/UDF/UDTF，如某任务里调用的 greedy_session）想知道它怎么实现/源码是什么/算法是什么时，用 `mc_query.py func <函数名>` 把注册信息和实现源码拉出来读，别凭函数名猜逻辑。涉及 ODPS、MaxCompute、ds 分区表、MAX_PT、dwd/dws/ads 等数仓表名/特征时尤其适用。边界（不触发）：纯 SQL 语法/概念讲解、与线上数仓无关的纯方言互转（如业务库 MySQL↔PostgreSQL 改写、无可连线上表）、非 SQL 的代码 review。
 ---
 
 # MaxCompute 数仓排查取数
@@ -158,6 +158,19 @@ python .claude/skills/maxcompute-query/scripts/mc_query.py sample dwd_fran_dev_h
 ```
 
 `desc` 会告诉你分区字段叫什么（`ds`/`pt`/`dt` 等不一定）——这决定了 WHERE 怎么写。
+
+**遇到不认识的自定义函数（UDF/UDTF）时，先读它的实现，别当黑盒。** 审查/改造任务 SQL 时常碰到非内建函数调用（如 `greedy_session(...)`），光看调用点猜不出它在算什么——用 `func` 把注册信息（AS 类名 / USING 资源）和**实现源码**拉出来读。这同样是只读操作，不会执行函数本身：
+
+```bash
+# 名字记不全先按子串找
+python .claude/skills/maxcompute-query/scripts/mc_query.py list-functions greedy
+
+# 读 UDF 的注册信息 + Python 源码（Java UDF 是 jar 二进制，无源码可读，会标注）
+python .claude/skills/maxcompute-query/scripts/mc_query.py func greedy_session
+
+# 只想看 USING 里某一个资源文件
+python .claude/skills/maxcompute-query/scripts/mc_query.py resource greedy_session.py
+```
 
 ### 3. 编写 MaxCompute SQL
 基于探查到的真实字段写 SQL。关键点（完整方言见 [references/maxcompute_sql.md](references/maxcompute_sql.md)）：

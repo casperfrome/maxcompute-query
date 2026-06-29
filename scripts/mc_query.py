@@ -9,6 +9,9 @@ mc_query.py — MaxCompute / ODPS 数仓排查取数辅助工具
     python mc_query.py desc <table>                 # 看字段 + 分区
     python mc_query.py partitions <table> [-n 20]   # 看最近分区 + 最新分区
     python mc_query.py sample <table> [-n 10]       # 按最新分区采样几行
+    python mc_query.py list-functions [pattern]     # 找自定义函数 (UDF)
+    python mc_query.py func <name>                  # 读 UDF 注册信息 + 实现源码
+    python mc_query.py resource <name>              # 读单个资源文件内容
     python mc_query.py sql -q "<inline sql>"        # 执行只读 SQL
     python mc_query.py sql -f query.sql --save out.xlsx
 
@@ -472,6 +475,149 @@ def cmd_sample(args):
     print("\n" + format_run_meta(meta))
 
 
+# ---------------------------------------------------------------------------
+# UDF / 资源读取（只读：排查时读懂自定义函数的实现，不执行、不改）
+# ---------------------------------------------------------------------------
+# 审查任务 SQL 常遇到非内建函数调用（如 greedy_session(...)），光看调用点猜不出它在算什么。
+# 这组命令把 UDF 的注册信息（AS 类名 / USING 资源）和**实现源码**拉出来读：Python UDF 的源码
+# 在它 USING 的 .py 资源里，Java UDF 在二进制 jar 里（无源码可读），嵌入式/SQL 函数则内联在
+# Function.code。读取走 pyodps 的只读接口，不触碰 SQL 引擎、不调用函数本身。
+
+# 能当文本读出源码的资源类型（其余如 JAR/ARCHIVE 是二进制，只标注不读内容）
+_TEXT_RESOURCE_TYPES = {"PY", "FILE"}
+
+
+def _resource_type_name(res) -> str:
+    """取资源类型名（PY/FILE/JAR/ARCHIVE/TABLE/...），取不到返回 UNKNOWN。"""
+    t = getattr(res, "type", None)
+    return getattr(t, "name", str(t)) if t is not None else "UNKNOWN"
+
+
+def _read_resource_text(res):
+    """按资源类型读出文本内容，返回 (text, note)。
+
+    - PY/FILE 文本资源 → (源码字符串, None)
+    - JAR/ARCHIVE 二进制 → (None, 说明)：源码不在资源文件里（如 Java UDF 编译进了 jar）
+    - TABLE 资源 → (None, 引用的表名)
+    - 读取异常 → (None, 错误说明)，元信息式降级，不抛出
+    """
+    rtype = _resource_type_name(res)
+    if rtype == "TABLE":
+        src = _safe(lambda: res.get_source_table())
+        return None, f"表资源，引用表：{src}" if src else "表资源（引用的表名取不到）"
+    if rtype not in _TEXT_RESOURCE_TYPES:
+        return None, f"{rtype} 资源为二进制（如 Java UDF 的 jar），源码不在资源文件内，无法以文本读取"
+    try:
+        with res.open(mode="r") as f:
+            return f.read(), None
+    except Exception as e:
+        return None, f"（无法以文本读取该资源：{e}）"
+
+
+def cmd_list_functions(args):
+    odps = get_odps()
+    pattern = (args.pattern or "").lower()
+    names = []
+    for fn in odps.list_functions():
+        name = fn.name
+        if pattern and pattern not in name.lower():
+            continue
+        names.append(name)
+    if not names:
+        print(f"未找到匹配 '{args.pattern}' 的函数。" if args.pattern else "未找到任何自定义函数。")
+        return
+    print(f"匹配到 {len(names)} 个函数" + (f"（pattern='{args.pattern}'）" if args.pattern else "") + "：")
+    for n in names:
+        print(f"  {n}")
+
+
+def cmd_func(args):
+    odps = get_odps()
+    name = args.name
+    if not odps.exist_function(name):
+        print(f"函数不存在：{name}（用 list-functions 核对真实函数名）", file=sys.stderr)
+        sys.exit(1)
+    fn = odps.get_function(name)
+
+    print(f"函数: {name}")
+    if getattr(fn, "owner", None):
+        print(f"owner: {fn.owner}")
+    ctime = _safe(lambda: fn.creation_time)
+    if ctime:
+        print(f"创建时间: {ctime}")
+    if getattr(fn, "class_type", None):
+        print(f"AS (类名/函数体): {fn.class_type}")
+    lang = _safe(lambda: fn.program_language)
+    if lang:
+        print(f"语言: {lang}")
+    is_sql = _safe(lambda: fn.is_sql_function)
+    if is_sql:
+        print("类型: SQL/嵌入式函数")
+
+    resources = _safe(lambda: list(fn.resources)) or []
+    if resources:
+        print("\nUSING 资源:")
+        for res in resources:
+            print(f"  {res.name}\t[{_resource_type_name(res)}]")
+
+    # 嵌入式/SQL 函数：实现内联在 code
+    code = _safe(lambda: fn.code)
+    if code:
+        print("\n--- 函数实现 (embedded code) ---")
+        print(code)
+
+    # 普通 UDF：实现源码在 USING 的文本资源里
+    text_sources = []
+    for res in resources:
+        text, note = _read_resource_text(res)
+        if text is not None:
+            text_sources.append((res.name, text))
+        elif note:
+            print(f"\n[{res.name}] {note}", file=sys.stderr)
+
+    if not text_sources and not code:
+        print("\n（未找到可读取的源码：可能是 Java UDF（jar 二进制）或无关联资源）", file=sys.stderr)
+
+    if args.save:
+        _save_sources(args.save, text_sources, code)
+        return
+
+    for res_name, text in text_sources:
+        print(f"\n--- 源码: {res_name} ---")
+        print(text)
+
+
+def cmd_resource(args):
+    odps = get_odps()
+    name = args.name
+    if not odps.exist_resource(name):
+        print(f"资源不存在：{name}", file=sys.stderr)
+        sys.exit(1)
+    res = odps.get_resource(name)
+    text, note = _read_resource_text(res)
+    if text is None:
+        print(f"[{name}] {note}", file=sys.stderr)
+        sys.exit(1)
+    if args.save:
+        with open(args.save, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"已保存资源 {name} 至 {args.save}")
+    else:
+        print(text)
+
+
+def _save_sources(path, text_sources, code):
+    """把 UDF 源码落盘：单一来源直接写；多来源/含 code 时加分隔标题汇总到一个文件。"""
+    parts = []
+    if code:
+        parts.append(f"-- embedded code --\n{code}")
+    for res_name, text in text_sources:
+        parts.append(f"-- 源码: {res_name} --\n{text}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n\n".join(parts))
+    print(f"已保存 {len(parts)} 份源码至 {path}")
+
+
 def cmd_sql(args):
     if bool(args.query) == bool(args.file):
         print("请用 -q \"<sql>\" 或 -f <file.sql> 二选一提供 SQL。", file=sys.stderr)
@@ -545,6 +691,20 @@ def build_parser():
     sp.add_argument("table")
     sp.add_argument("-n", type=int, default=10, help="采样行数，默认 10")
     sp.set_defaults(func=cmd_sample)
+
+    sp = sub.add_parser("list-functions", help="列出自定义函数 UDF（可按名称子串过滤）")
+    sp.add_argument("pattern", nargs="?", default=None, help="名称子串过滤")
+    sp.set_defaults(func=cmd_list_functions)
+
+    sp = sub.add_parser("func", help="读取 UDF 的注册信息与实现源码")
+    sp.add_argument("name")
+    sp.add_argument("--save", help="把源码落盘到该路径")
+    sp.set_defaults(func=cmd_func)
+
+    sp = sub.add_parser("resource", help="读取单个资源文件的文本内容")
+    sp.add_argument("name")
+    sp.add_argument("--save", help="把资源内容落盘到该路径")
+    sp.set_defaults(func=cmd_resource)
 
     sp = sub.add_parser("sql", help="执行只读 SQL")
     g = sp.add_mutually_exclusive_group(required=True)

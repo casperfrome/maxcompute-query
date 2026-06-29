@@ -6,6 +6,7 @@
 
 - 探查表结构、分区、字段分布
 - 编写并执行只读 SQL，为结论取数佐证
+- 读取**自定义函数（UDF/UDTF）的注册信息与实现源码**（`func` / `list-functions` / `resource`）：Python UDF 从 `.py` 资源读出完整源码、嵌入式/SQL 函数读 `code`、Java UDF（jar 二进制）标注无源码可读——审查任务 SQL 时遇到未知函数不必当黑盒
 - 审查 / 重构在线数仓 SQL 任务（粒度、去重、JOIN 膨胀、分区过滤等）
 - 从 DataWorks 拉取任务的线上 SQL 及历史版本（`scripts/fetch_task_sql.py`）
 - 读取 / 解读**数据集成（离线同步）任务**：自动给出源表 → 目标表、写入模式、reader/writer 列按位置映射对照（含错位审查）
@@ -16,7 +17,7 @@
 SKILL.md                    技能说明（触发条件、工作流）
 scripts/
   config.example.py         连接配置模板（密钥走环境变量；config.py 仅存非密钥配置）
-  mc_query.py               执行只读 SQL / 探查表结构
+  mc_query.py               执行只读 SQL / 探查表结构 / 读取 UDF 源码（func、list-functions、resource）
   fetch_task_sql.py         从 DataWorks 拉取任务 SQL / 历史版本，并解读数据集成离线同步任务
   di_task.py                数据集成同步配置解析（源/目标/写入模式/列映射审查）
   build_validation_sql.py   生成校验 SQL
