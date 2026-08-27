@@ -102,6 +102,25 @@ class Cte:
         self.had_partition = False
 
 
+def _shorten_qualified_cte_refs(fragment: str, cte_short_names: dict) -> str:
+    """将已识别 CTE 的 schema-qualified 引用改为短名，不触碰串或注释。"""
+    if not cte_short_names:
+        return fragment
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9_.])(?:[A-Za-z_]\w*\.)+(" + "|".join(
+            re.escape(name) for name in sorted(cte_short_names, key=len, reverse=True)
+        ) + r")(?![A-Za-z0-9_.])",
+        re.IGNORECASE,
+    )
+    mask = _mask_literals(fragment)
+    spans = [(m.start(), m.end(), cte_short_names[m.group(1).lower()])
+             for m in pattern.finditer(mask)]
+    out = fragment
+    for start, end, replacement in reversed(spans):
+        out = out[:start] + replacement + out[end:]
+    return out
+
+
 def inline_task(sql: str, target: str = None):
     """把任务正文转成单条 WITH。返回 (with_sql, warnings, cte_names, final_target)。"""
     stmts = split_statements(sql)
@@ -209,7 +228,7 @@ def inline_task(sql: str, target: str = None):
         key = short(target).lower()
         if key not in by_name:
             raise ValueError(
-                f"--target `{target}` 不在识别到的 tmp 列表里。可用：{[short(n) for n in cte_names]}")
+                f"--target `{target}` 不在识别到的 tmp 列表里。可用：{[short(c.name) for c in ctes]}")
         idx = by_name[key]
         ctes = ctes[:idx + 1]
         terminal = f"SELECT * FROM {ctes[idx].name}"
@@ -219,6 +238,13 @@ def inline_task(sql: str, target: str = None):
                 "未找到最终输出语句（INSERT OVERWRITE 到非 tmp 目标或裸 SELECT）。"
                 "若想验证到某张中间表，请用 --target <tmp名>。")
         terminal = final_body
+
+    # CTE 名不能带 schema；把已识别 tmp 的限定引用同步改为短名，防止验证 SQL 回读物理 tmp。
+    cte_short_names = {short(c.name).lower(): short(c.name) for c in ctes}
+    for c in ctes:
+        c.body = _shorten_qualified_cte_refs(c.body, cte_short_names)
+        c.name = short(c.name)
+    terminal = _shorten_qualified_cte_refs(terminal, cte_short_names)
 
     cte_names = [c.name for c in ctes]            # 反映最终（--target 切片后）实际入选的 CTE
     if not ctes:
@@ -262,8 +288,13 @@ def parse_with_query(sql: str):
 def _prefix_idents(fragment: str, names: set, prefix: str) -> str:
     """把 fragment 里出现的、属于 names 的标识符（定义处和引用处）统一加前缀。基于掩码，不碰串/注释。"""
     mask = _mask_literals(fragment)
-    spans = [(m.start(), m.end()) for m in re.finditer(r"\b[A-Za-z_]\w*\b", mask)
-             if m.group(0).lower() in names]
+    spans = [
+        (m.start(), m.end())
+        for m in re.finditer(r"\b[A-Za-z_]\w*\b", mask)
+        if m.group(0).lower() in names
+        and (m.start() == 0 or mask[m.start() - 1] != ".")
+        and (m.end() == len(mask) or mask[m.end()] != ".")
+    ]
     out = fragment
     for s, e in reversed(spans):
         out = out[:s] + prefix + out[s:e] + out[e:]

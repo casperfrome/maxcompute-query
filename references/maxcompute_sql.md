@@ -2,6 +2,8 @@
 
 排查取数时最常踩的坑都在分区和函数上。下面是写 MaxCompute SQL 必须记住的关键点。
 
+表名写法遵循 [SKILL.md 的表名前缀规范](../SKILL.md#表名前缀规范本项目)：`tmp` 开头的物理表无前缀，其他物理表带真实所属前缀；CTE 名称和别名不加前缀。
+
 ## 目录
 - [分区：永远先过滤](#分区永远先过滤)
 - [常用元数据 / 探查](#常用元数据--探查)
@@ -15,7 +17,7 @@
 
 MaxCompute 是按分区扫描计费的，不带分区过滤的查询会**全表扫描**，又慢又贵，排查时极易踩雷。
 
-- 取最新分区：`WHERE ds = MAX_PT('project.table')` 或同库下 `MAX_PT('table')`。
+- 取最新分区：非 `tmp` 物理表使用 `WHERE ds = MAX_PT('project.table')`，表名与 FROM/JOIN 中的完整表名一致；`tmp` 开头的分区表则使用不带前缀的表名。
   - `MAX_PT` 返回该表**有数据**的最大分区值（字符串），比手写日期更稳。
 - 指定某天：`WHERE ds = '20240506'`（分区值通常是字符串，注意加引号）。
 - 区间：`WHERE ds BETWEEN '20240501' AND '20240506'`。
@@ -34,9 +36,10 @@ MaxCompute 是按分区扫描计费的，不带分区过滤的查询会**全表�
 
 手写等价 SQL（必要时）：
 ```sql
-SHOW PARTITIONS table_name;            -- 看分区
-SELECT MAX_PT('table_name');           -- 看最新分区值
-SELECT * FROM t WHERE ds=MAX_PT('t') LIMIT 10;
+SHOW PARTITIONS tst_mc_prod.table_name;             -- 看分区
+SELECT MAX_PT('tst_mc_prod.table_name');            -- 看最新分区值
+SELECT * FROM tst_mc_prod.table_name
+WHERE ds=MAX_PT('tst_mc_prod.table_name') LIMIT 10;
 ```
 
 ## 字符串与空值
@@ -76,4 +79,4 @@ SELECT * FROM t WHERE ds=MAX_PT('t') LIMIT 10;
 | `Table not found` | 表名拼错，或需带 project 前缀；先 `list-tables` 确认 |
 | `Column not found` | 列名猜错；先 `desc` 确认字段名 |
 | 分区过滤无结果 | `ds` 值类型/格式不对（字符串要加引号），或该分区无数据，用 `MAX_PT` 更稳 |
-| `MAX_PT` 报错 | 表名要带引号字符串，如 `MAX_PT('t')`，且表需已有数据分区 |
+| `MAX_PT` 报错 | 表名要带引号字符串，如 `MAX_PT('tst_mc_prod.table_name')`，且表需已有数据分区 |

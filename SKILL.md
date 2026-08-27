@@ -1,6 +1,6 @@
 ---
 name: maxcompute-query
-description: 通过辅助脚本探查表结构、编写并执行 MaxCompute (ODPS) 只读 SQL 来排查数仓/数据问题，并用真实数据为结论佐证。三类场景都要触发，且即使用户没明说「写 SQL / 查数据 / 验证一下」也要主动取数，而不是只静态阅读或闭眼改写：(1) 取数排查——任何需查数仓才能回答的诉求（核对指标/数量、看某表某字段的数据情况、统计分布/占比/Top N、查空值或脏数据、对某现象取数验证）；(2) 审查既有 SQL——给一段 MaxCompute/ODPS 任务或 .sql/.txt，找逻辑漏洞、bug、口径错误、解释结果为何不对（常见可疑点：建表/依赖顺序读到旧数据、窗口 PARTITION BY 粒度错、JOIN 缺键膨胀、缺分区过滤、NULL/重复/口径偏差，多能用线上数据证实或证伪）；(3) 修改/重构既有 SQL——改唯一键/粒度、加去重、改 JOIN、增删字段、调过滤，改前用真实数据核实前提（是否真会膨胀、是否真有重复），改后用数据验证结果（新唯一键是否真唯一、行数增减是否合预期）。只给表名/任务名而没贴 SQL（如「看看 dws_xxx 这个任务有没有问题」「帮我改下这个任务」）也要触发，先用 fetch_task_sql.py 按产出表名自动从 DataWorks 拉取线上 SQL 再审查/修改，别反过来让用户贴。拉回的可能不是 ODPS SQL 而是数据集成离线同步任务（DataWorks DI 节点，命名多为 to_holo_..._di，常见 MaxCompute→Hologres），脚本会自动识别并解读出「源→目标、写入模式、reader/writer 列按位置映射对照」；用户问「这个同步任务把哪张表同步到哪 / 列有没有错位 / 这张 Holo 表从哪同步来」时同样触发。用户提到任务的历史版本（上一版、版本对比、最近改了什么）时，用 --list-versions / --get-version N / --diff A B 拉取。审查任务 SQL 时遇到非内建函数调用（自定义函数/UDF/UDTF，如某任务里调用的 greedy_session）想知道它怎么实现/源码是什么/算法是什么时，用 `mc_query.py func <函数名>` 把注册信息和实现源码拉出来读，别凭函数名猜逻辑。涉及 ODPS、MaxCompute、ds 分区表、MAX_PT、dwd/dws/ads 等数仓表名/特征时尤其适用。边界（不触发）：纯 SQL 语法/概念讲解、与线上数仓无关的纯方言互转（如业务库 MySQL↔PostgreSQL 改写、无可连线上表）、非 SQL 的代码 review。
+description: 使用辅助脚本探查 MaxCompute/ODPS 表并执行只读 SQL，以真实数据完成数仓取数排查、指标/分布/空值验证、既有任务 SQL 审查或修改验证、DataWorks 任务拉取与版本对比，以及 DI 同步任务和 UDF 溯源。用户提到 ODPS、MaxCompute、DataWorks、MAX_PT、ds 分区、dwd/dws/ads 表、线上任务 SQL 或数仓数据异常时使用；先探查再查询，绝不改数。纯 SQL 概念讲解、无线上数仓的方言改写或非 SQL 代码审查不使用。
 ---
 
 # MaxCompute 数仓排查取数
@@ -15,7 +15,17 @@ description: 通过辅助脚本探查表结构、编写并执行 MaxCompute (ODP
 
 **先探查，再动手。** 不要凭记忆或猜测写列名、表名。线上表多、命名长、字段杂，猜错就白跑一轮。先用脚本摸清现状再写正式 SQL。
 
-**永远按分区过滤。** MaxCompute 按扫描分区计费，漏掉分区过滤会全表扫描——又慢又贵，是排查时最容易踩的雷。每张分区表都要带 `ds=MAX_PT('表')` 或具体分区。详见 [references/maxcompute_sql.md](references/maxcompute_sql.md)。
+**永远按分区过滤。** MaxCompute 按扫描分区计费，漏掉分区过滤会全表扫描——又慢又贵，是排查时最容易踩的雷。每张分区表都要带 `ds=MAX_PT('tst_mc_prod.表')` 或具体分区。详见 [references/maxcompute_sql.md](references/maxcompute_sql.md)。
+
+### 表名前缀规范（本项目）
+
+生成、改写及交付 SQL 时，按物理表名本身（不含前缀，大小写不敏感）应用以下规则：
+
+- **以 `tmp` 开头的物理表不带 schema/project 前缀**：例如 `tst_mc_prod.tmp_xxx` 写成 `tmp_xxx`。定义和所有引用必须一致。
+- **其他物理表必须带真实所属 schema/project 前缀**：本项目默认为 `tst_mc_prod`；已确认的跨项目表保留其真实前缀，不能统一改成 `tst_mc_prod`，归属不明时先核实。
+- 规则覆盖 `CREATE/DROP/ALTER TABLE`、`INSERT` 目标、`FROM/JOIN` 引用，以及 `MAX_PT('表名')` 中的物理表名；注释中的可复制 SQL/DDL 示例也保持一致。
+- CTE 名称、子查询别名和 `A.column` 等字段引用不属于物理表名，不加前缀。辅助脚本的表名参数不等同于 SQL 文本，不按此规则机械改写。
+- 无前缀的 `tmp` 表解析到任务当前项目；本项目任务应在 `tst_mc_prod` 下执行。此规范不授权修改连接配置或执行 SQL 写操作。
 
 ## 什么时候停下来用提问框问用户
 
@@ -106,8 +116,8 @@ python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --save 
 1. **拉取 + 分析（任务代码分析器）。** 起一个 [task-analyzer](agents/task-analyzer.md) 子代理：只给了任务名就让它先 `fetch_task_sql.py` 拉代码，通读后回传结构化清单——「读代码即可定论的 bug」与「需数据佐证的疑点」分开，后者每条已写成自包含的验证问题。任务很短、或用户已贴出 SQL 时，你也可以自己读、自己列疑点，不强求起子代理。
    - 若怀疑「问题/回归是最近一次改动引入的」，先 `fetch_task_sql.py <表> --list-versions` 看改动时间线、再 `--diff <旧版> <新版>` 定位是哪一版改了哪几行（命令见 [references/fetch_task_sql.md](references/fetch_task_sql.md)，这步你自己内联跑即可）。
 2. **并行取数证实/证伪（验证器）。** 把上一步「需数据佐证的疑点」**在同一条消息里并行**交给多个 [verifier](agents/verifier.md) 子代理，每个查一条（务必带分区过滤）。常见疑点对应的查法：
-   - 字段恒为 NULL → 查非空占比：`SELECT COUNT(*) total, COUNT(request_status) non_null FROM 表 WHERE ds=MAX_PT('表') AND oa_name='...'`。
-   - 一个 `request_id` 对多 `file_id` 导致窗口串值 → `SELECT request_id, COUNT(DISTINCT file_id) c FROM 源表 WHERE ds=... GROUP BY request_id HAVING c>1 LIMIT 20`。
+   - 字段恒为 NULL → 查非空占比：`SELECT COUNT(*) total, COUNT(request_status) non_null FROM tst_mc_prod.表 WHERE ds=MAX_PT('tst_mc_prod.表') AND oa_name='...'`。
+   - 一个 `request_id` 对多 `file_id` 导致窗口串值 → `SELECT request_id, COUNT(DISTINCT file_id) c FROM tst_mc_prod.源表 WHERE ds=... GROUP BY request_id HAVING c>1 LIMIT 20`。
    - JOIN 膨胀 → 比对 JOIN 前后行数 / 主键去重数。
    - 依赖顺序导致旧数据 → 对比临时表的数据日期与当前 `${bizdate}`。
    能证实/证伪的疑点默认自己查、不先问用户；验证中若冒出「取决于用户口径/意图」的分叉，仍按上文那节带选项问。疑点只有一两条时自己跑 `mc_query.py` 即可，不必为并行而并行。
@@ -124,7 +134,7 @@ python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --save 
 1. **拉取 + 分析（任务代码分析器）。** 起 [task-analyzer](agents/task-analyzer.md)（场景填 `修改(C)` 并附「要改成什么」），让它回传两份清单：**改动前需验证的前提** 和 **改动后需自检的断言**——都已写成可直接交给验证器的形式。
    - **改造意图本身有歧义就先用提问框问清，再 dispatch 验证器。** 修改类诉求最容易藏着「取决于用户」的取舍：唯一键边界（含不含 `node_oper`）、按哪个时间字段取最早、并列/NULL 如何处理。这些数据判不了，硬挑一个会让后面整轮验证都架在错误的改法上。若 task-analyzer 回传了「需用户澄清的决策点」，或你自己一眼看出这种分叉，先用 `AskUserQuestion` 带选项（连同已查到的字段格式/重复规模）问清，拿到答复再往下。
 2. **改前并行验证前提（验证器）。** 把「需验证的前提」**并行**交给 [verifier](agents/verifier.md)，务必带分区过滤。典型前提：
-   - 要按 (a,b,c) 去重取最早 → 现状是否真有重复及规模：`SELECT a,b,c,COUNT(*) n FROM 表 WHERE ds=MAX_PT('表') GROUP BY a,b,c HAVING n>1 LIMIT 20`；没有重复就说明根本不需要这步去重。
+   - 要按 (a,b,c) 去重取最早 → 现状是否真有重复及规模：`SELECT a,b,c,COUNT(*) n FROM tst_mc_prod.表 WHERE ds=MAX_PT('tst_mc_prod.表') GROUP BY a,b,c HAVING n>1 LIMIT 20`；没有重复就说明根本不需要这步去重。
    - 方案依赖「按某时间字段排序取最早」→ 先 `sample` 看该字段格式是否统一、能否按字符串/类型正确比较，否则排序结果是错的。
    - 要删/合并某字段、或动某个 JOIN → 先查它当前的非空占比、是否一对多，确认改动不会丢数或意外膨胀。
    （前提只有一两条时，自己跑 `mc_query.py` 即可，不必为并行而并行。）
@@ -174,16 +184,16 @@ python .claude/skills/maxcompute-query/scripts/mc_query.py resource greedy_sessi
 
 ### 3. 编写 MaxCompute SQL
 基于探查到的真实字段写 SQL。关键点（完整方言见 [references/maxcompute_sql.md](references/maxcompute_sql.md)）：
-- 每张分区表都带分区过滤，取最新分区用 `WHERE ds=MAX_PT('表')`。
+- 每张分区表都带分区过滤，取最新分区用 `WHERE ds=MAX_PT('tst_mc_prod.表')`。
 - 空值排查注意 `col IS NULL OR col=''`；去重计数 `COUNT(DISTINCT col)`；分组取 Top N 用 `ROW_NUMBER() OVER(...)`。
-- SQL 提交前自检：FROM 的每张分区表，WHERE 是否都带了分区过滤？
+- SQL 提交前自检：按上文「表名前缀规范」核对所有物理表的定义与引用，再检查每张分区表是否带了分区过滤。
 
 ### 4. 执行
 短 SQL 直接行内执行；复杂 SQL 写到临时 `.sql` 文件再 `-f` 执行（更好读、可复用）：
 
 ```bash
 # 行内
-python .claude/skills/maxcompute-query/scripts/mc_query.py sql -q "SELECT 区域性质, COUNT(*) cnt FROM ... GROUP BY 区域性质 ORDER BY cnt DESC"
+python .claude/skills/maxcompute-query/scripts/mc_query.py sql -q "SELECT 区域性质, COUNT(*) cnt FROM tst_mc_prod.表 WHERE ds=MAX_PT('tst_mc_prod.表') GROUP BY 区域性质 ORDER BY cnt DESC"
 
 # 文件
 python .claude/skills/maxcompute-query/scripts/mc_query.py sql -f query.sql
@@ -200,7 +210,7 @@ SQL 执行失败时，脚本会打印一段清晰的报错（错误信息 + 出�
 - `Table not found` / `表不存在` → 表名拼错或缺 project 前缀，用 `list-tables` 重新确认真实表名。
 - `Column not found` / `Invalid column` / 字段不存在 → 列名猜错或用了用户口语里的叫法（如把 `city_name` 说成 `city`），用 `desc` 核对真实字段名再改。
 - 语法/解析错误（`ParseException` / `SemanticException`）→ 对照 [references/maxcompute_sql.md](references/maxcompute_sql.md) 检查函数名、引号、`GROUP BY` 是否漏列。
-- 空结果（成功但 0 行）→ 多半是过滤太严或分区取错：确认 `ds` 用了 `MAX_PT('表')`、值类型/格式对得上，必要时先 `sample` 看真实数据。
+- 空结果（成功但 0 行）→ 多半是过滤太严或分区取错：确认 `ds` 用了 `MAX_PT('tst_mc_prod.表')`、值类型/格式对得上，必要时先 `sample` 看真实数据。
 
 一般 2-3 次内能修好。技术性报错（表名/列名/语法/空结果）属于「能查就别问」——自己读懂、改、重试，只有连续几次仍卡在同一类错误才上抛兜底；若分不清该用哪个业务字段/口径，则属于「取决于用户、该问」，用 `AskUserQuestion` 带选项问清，不必等到卡死（详见上文那节）。
 

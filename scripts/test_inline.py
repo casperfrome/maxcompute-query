@@ -70,6 +70,55 @@ check(len(ctes_t) == 1, f"[target] --target tmp_a 应只含 1 张 CTE，得到 {
 check(sql_t.rstrip().endswith("SELECT * FROM tmp_a"), "[target] 收尾应为 SELECT * FROM tmp_a")
 check("tmp_b" not in sql_t, "[target] 不应包含 tmp_a 之后的 tmp_b")
 
+# --target：非法中间表必须给出可操作的 ValueError
+try:
+    inline_task(LINEAR, target="tmp_missing")
+except ValueError as error:
+    check("tmp_missing" in str(error),
+          f"[invalid-target] 错误消息应包含非法 target，得到：{error}")
+    check("tmp_a" in str(error) and "tmp_b" in str(error),
+          f"[invalid-target] 错误消息应包含可用 tmp 列表，得到：{error}")
+else:
+    failures.append("[invalid-target] 非法 target 应抛出 ValueError")
+
+
+# ---------------------------------------------------------------------------
+# inline / compare：schema-qualified tmp 必须成为无 schema 的 CTE，避免回读物理 tmp
+# ---------------------------------------------------------------------------
+QUALIFIED_TMP = """
+CREATE TABLE tmp_a AS SELECT id FROM src WHERE ds='${bizdate}';
+CREATE TABLE tmp_b AS SELECT id FROM tst_mc_prod.tmp_a;
+INSERT OVERWRITE TABLE final_out SELECT id FROM tst_mc_prod.tmp_b;
+"""
+qualified_sql, _, qualified_ctes, _ = inline_task(QUALIFIED_TMP)
+expect_readonly(qualified_sql, "qualified-tmp-inline")
+check(qualified_ctes == ["tmp_a", "tmp_b"],
+      f"[qualified-tmp-inline] CTE 应使用短名，得到 {qualified_ctes}")
+check("tmp_a AS (" in qualified_sql and "tmp_b AS (" in qualified_sql,
+      "[qualified-tmp-inline] 限定 tmp 应展开成同名短 CTE")
+check("tst_mc_prod.tmp_a" not in qualified_sql and "tst_mc_prod.tmp_b" not in qualified_sql,
+      "[qualified-tmp-inline] 生成物不能回读 schema-qualified tmp")
+
+qualified_cmp = build_compare(qualified_sql, qualified_sql, ["id"], [])
+expect_readonly(qualified_cmp, "qualified-tmp-compare")
+check("o_tmp_a AS (" in qualified_cmp and "n_tmp_b AS (" in qualified_cmp,
+      "[qualified-tmp-compare] 两侧 CTE 应分别加 o_/n_ 前缀")
+check("tst_mc_prod.o_tmp" not in qualified_cmp and "tst_mc_prod.n_tmp" not in qualified_cmp,
+      "[qualified-tmp-compare] 不得把 schema-qualified tmp 仅前缀化末段")
+check("tst_mc_prod.tmp_a" not in qualified_cmp and "tst_mc_prod.tmp_b" not in qualified_cmp,
+      "[qualified-tmp-compare] 不得保留 schema-qualified 物理 tmp 引用")
+
+qualified_source_cmp = build_compare(
+    "WITH t AS (SELECT id FROM source.t) SELECT id FROM t",
+    "WITH t AS (SELECT id FROM source.t) SELECT id FROM t",
+    ["id"],
+    [],
+)
+check("FROM source.t" in qualified_source_cmp,
+      "[qualified-source-compare] schema-qualified 基表末段不得被当作 CTE 前缀化")
+check("source.o_t" not in qualified_source_cmp and "source.n_t" not in qualified_source_cmp,
+      "[qualified-source-compare] 不得改写 schema-qualified 基表")
+
 
 # ---------------------------------------------------------------------------
 # inline：依赖顺序倒置（tmp_early 引用了定义更靠后的 tmp_late）→ 必须标记
