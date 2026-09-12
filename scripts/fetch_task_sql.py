@@ -50,12 +50,8 @@ except Exception:
 # 把脚本所在目录加入 import 路径，确保以文件方式直接运行时也能 import 同目录的 config
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import config  # noqa: E402  # 连接凭证/端点的单一来源（与 mc_query.py 共用，可用环境变量覆盖）
-from config import require_credentials  # noqa: E402  # 单独引入：create_client 内局部变量名 config 会遮蔽模块
+import runtime_config as config  # noqa: E402  # 连接凭证/端点的单一来源（与 mc_query.py 共用，可用环境变量覆盖）
 import di_task  # noqa: E402  # 识别/解读数据集成(离线同步)任务的 DataX 配置（纯文本，不连网）
-from alibabacloud_dataworks_public20200518 import models as dataworks_models  # noqa: E402
-from alibabacloud_dataworks_public20200518.client import Client as DataWorksClient  # noqa: E402
-from alibabacloud_tea_openapi import models as open_api_models  # noqa: E402
 
 # DataWorks 用的 AK/SK 与 mc_query.py 里的 ODPS 凭证是同一套，统一从 config 读取。
 ACCESS_ID = config.ACCESS_ID
@@ -85,13 +81,15 @@ class SavedAPIError(RuntimeError):
 # DataWorks 客户端 & 取码
 # ---------------------------------------------------------------------------
 def create_client():
-    require_credentials()
-    config = open_api_models.Config(
+    config.validate_connection('dataworks')
+    from alibabacloud_dataworks_public20200518.client import Client as DataWorksClient
+    from alibabacloud_tea_openapi import models as open_api_models
+    client_config = open_api_models.Config(
         access_key_id=ACCESS_ID,
         access_key_secret=SECRET,
     )
-    config.endpoint = DATAWORKS_ENDPOINT
-    return DataWorksClient(config)
+    client_config.endpoint = DATAWORKS_ENDPOINT
+    return DataWorksClient(client_config)
 
 
 def list_matching_files(client, task_name):
@@ -103,6 +101,7 @@ def list_matching_files(client, task_name):
     keyword_lower = task_name.strip().lower()
 
     while True:
+        from alibabacloud_dataworks_public20200518 import models as dataworks_models
         request = dataworks_models.ListFilesRequest(
             project_id=DATAWORKS_PROJECT_ID,
             page_number=page_number,
@@ -154,6 +153,7 @@ def list_matching_files(client, task_name):
 
 def get_nodes_by_output(client, task_name):
     """按「产出表名」反查生产环境的任务节点。任务文件名 ≠ 表名时靠这个兜底。"""
+    from alibabacloud_dataworks_public20200518 import models as dataworks_models
     request = dataworks_models.ListNodesByOutputRequest(
         project_env="PROD",
         outputs=f"{DATAWORKS_ODPS_PROJECT_NAME}.{task_name}",
@@ -181,6 +181,7 @@ def get_nodes_by_output(client, task_name):
 
 def get_node_code(client, node_id):
     """取生产环境某节点的 SQL 代码。"""
+    from alibabacloud_dataworks_public20200518 import models as dataworks_models
     request = dataworks_models.GetNodeCodeRequest(
         node_id=node_id,
         project_env="PROD",
@@ -270,12 +271,12 @@ def fetch_saved_task(name=None, file_id=None, client=None):
             raise _saved_api_error('ListFiles', exc) from None
         exact = [item for item in matches if (item.get('file_name') or '').lower() == name.lower()]
         if len(exact) > 1:
-            ids = ', '.join(str(item.get('file_id')) for item in exact)
-            raise TaskSqlNotFound('任务名 %r 存在多个保存态文件（file_id: %s）；请指定 --file-id。' % (name, ids))
+            _unique_candidate(exact, name)
         if not exact:
             raise TaskSqlNotFound('找不到精确任务名 %r 的保存态文件；可用 --search 查看候选。' % name)
         match = exact[0]
         file_id = _positive_file_id(match.get('file_id'))
+    from alibabacloud_dataworks_public20200518 import models as dataworks_models
     request = dataworks_models.GetFileRequest(project_id=DATAWORKS_PROJECT_ID, file_id=file_id)
     try:
         response = client.get_file(request)
@@ -349,38 +350,82 @@ def _result_from_match(client, match):
     return None
 
 
-def fetch_task_sql(task_name):
-    """主入口：先精确文件名匹配，再按产出表名反查节点；都没有则抛 TaskSqlNotFound。"""
-    name = task_name.strip()
-    if not name:
-        raise ValueError("表名/任务名不能为空。")
+def _unique_candidate(candidates, label):
+    if len(candidates) > 1:
+        details = '; '.join('name=%r folder=%r file_id=%s node_id=%s' % (
+            item.get('file_name') or item.get('node_name'), item.get('folder_path') or '',
+            item.get('file_id'), item.get('node_id')) for item in candidates)
+        raise TaskSqlNotFound('%s 存在多个候选，不能自动选择；请指定 --file-id 或 --node-id：%s' % (label, details))
+    return candidates[0] if candidates else None
 
-    client = create_client()
 
-    # 1) 文件名与传入名完全相等的，优先取它的 prod/dev SQL
-    matches = list_matching_files(client, name)
-    exact = [m for m in matches if (m.get("file_name") or "").lower() == name.lower()]
-    for match in exact:
-        result = _result_from_match(client, match)
-        if result is not None:
+def _file_by_id(client, file_id, name=None):
+    """Read identity/content once; empty saved content is allowed for history/prod."""
+    file_id = _positive_file_id(file_id)
+    from alibabacloud_dataworks_public20200518 import models as dataworks_models
+    try:
+        response = client.get_file(dataworks_models.GetFileRequest(
+            project_id=DATAWORKS_PROJECT_ID, file_id=file_id))
+    except Exception as exc:
+        raise _saved_api_error('GetFile', exc) from None
+    if not response.body.success:
+        raise _saved_api_error('GetFile', response.body)
+    saved = getattr(response.body.data, 'file', None)
+    if saved is None:
+        raise TaskSqlNotFound('file_id=%s 的文件不存在。' % file_id)
+    if getattr(saved, 'file_id', None) != file_id:
+        raise ValueError('GetFile 返回的 file_id 与请求不一致。')
+    actual_name = getattr(saved, 'file_name', None)
+    if not actual_name:
+        raise TaskSqlNotFound('file_id=%s 缺少文件名。' % file_id)
+    if name is not None and actual_name.lower() != name.strip().lower():
+        raise ValueError('file_id 与请求任务名不一致。')
+    return {key: getattr(saved, key, None) for key in (
+        'file_id', 'file_name', 'node_id', 'file_type', 'content', 'owner')} | {
+        'folder_path': getattr(saved, 'absolute_folder_path', None) or ''}
+
+
+def fetch_task_sql(task_name=None, file_id=None, node_id=None, client=None):
+    """Unique file/output selection; explicit node IDs fetch production only."""
+    if file_id is not None and node_id is not None:
+        raise ValueError('--file-id 与 --node-id 互斥。')
+    if node_id is not None and task_name is not None:
+        raise ValueError('--node-id 不能与任务名混用。')
+    name = task_name.strip() if task_name is not None else None
+    if name == '' or (name is None and file_id is None and node_id is None):
+        raise ValueError('请提供表名/任务名、--file-id 或 --node-id。')
+    if file_id is not None:
+        file_id = _positive_file_id(file_id)
+    if node_id is not None:
+        node_id = _positive_file_id(node_id)
+    client = client if client is not None else create_client()
+    if file_id is not None:
+        result = _result_from_match(client, _file_by_id(client, file_id, name))
+        if result is None:
+            raise TaskSqlNotFound('指定文件的生产态及开发态代码均为空。')
+        return result
+    if node_id is not None:
+        nodes = [dict(node_id=node_id, node_name=str(node_id))]
+    else:
+        matches = list_matching_files(client, name)
+        exact = [m for m in matches if (m.get('file_name') or '').lower() == name.lower()]
+        pick = _unique_candidate(exact, name)
+        if pick:
+            result = _result_from_match(client, pick)
+            if result is None:
+                raise TaskSqlNotFound('精确匹配文件的代码为空；不能改选其他任务。')
             return result
-
-    # 2) 兜底：按产出表名反查生产节点（任务名 ≠ 表名时也能命中）
-    for node in get_nodes_by_output(client, name):
-        prod_sql = get_node_code(client, node["node_id"]).strip()
+        nodes = get_nodes_by_output(client, name)
+    node = _unique_candidate(nodes, name or str(node_id))
+    if node:
+        prod_sql = get_node_code(client, node['node_id']).strip()
         if prod_sql:
-            return {
-                "task_name": name,
-                "node_id": node["node_id"],
-                "file_type": node.get("program_type"),
-                "program_type": node.get("program_type"),
-                "folder_path": "",
-                "source": "prod",
-                "sql_text": prod_sql,
-                "dev_sql_available": False,
-            }
-
-    raise TaskSqlNotFound(f"在 DataWorks 中找不到任务 '{name}' 的 SQL。")
+            return {'task_name': name or node.get('node_name') or str(node['node_id']),
+                'node_id': node['node_id'], 'file_id': node.get('file_id'),
+                'file_type': node.get('program_type'), 'program_type': node.get('program_type'),
+                'folder_path': node.get('folder_path') or '', 'source': 'prod',
+                'sql_text': prod_sql, 'dev_sql_available': False}
+    raise TaskSqlNotFound('指定任务的生产态代码不存在；请检查候选身份。')
 
 
 def search_task_sqls(task_name):
@@ -412,62 +457,29 @@ def _fmt_ts(ms):
         return str(ms)
 
 
-def resolve_file_id(client, name):
-    """把「表名/任务名」解析成 file_id（版本接口必需）。
-
-    顺序：①文件名精确相等 → ②唯一候选 → ③多候选抛歧义 → ④按产出表名反查节点，
-    用 node_name 回查文件 → ⑤仍无则抛 TaskSqlNotFound。
-    返回 {file_id, file_name, folder_path}。
-    """
-    name = name.strip()
-    if not name:
-        raise ValueError("表名/任务名不能为空。")
-
-    matches = list_matching_files(client, name)
-
-    # ① 文件名与传入名完全相等
-    exact = [m for m in matches if (m.get("file_name") or "").lower() == name.lower()]
-    pick = None
-    if exact:
-        pick = exact[0]
-    elif len(matches) == 1:
-        # ② 只有唯一候选，直接用它
-        pick = matches[0]
-    elif len(matches) > 1:
-        # ③ 多个候选，无法确定是哪一个
-        names = ", ".join(sorted({(m.get("file_name") or "") for m in matches})[:8])
-        raise TaskSqlNotFound(
-            f"名字匹配 '{name}' 的任务有多个（{names} ...），无法确定取哪个的版本历史。"
-            f"请用 `--search` 看候选后，传精确任务名重试。"
-        )
-
-    if pick is None:
-        # ④ 兜底：按产出表名反查生产节点，再用 node_name 回查文件拿 file_id
-        for node in get_nodes_by_output(client, name):
-            node_name = (node.get("node_name") or "").strip()
-            if not node_name:
-                continue
-            for m in list_matching_files(client, node_name):
-                if (m.get("file_name") or "").lower() == node_name.lower() and m.get(
-                    "file_id"
-                ):
-                    pick = m
-                    break
-            if pick is not None:
-                break
-
-    if pick is None or not pick.get("file_id"):
-        # ⑤ 实在解析不到 file_id
-        raise TaskSqlNotFound(
-            f"找不到任务 '{name}' 对应的文件（file_id），无法查版本历史。"
-            f"该任务可能不是文件态节点，或不在当前 DataWorks 工作空间。"
-        )
-
-    return {
-        "file_id": pick["file_id"],
-        "file_name": pick.get("file_name") or name,
-        "folder_path": pick.get("folder_path") or "",
-    }
+def resolve_file_id(client, name=None, file_id=None):
+    """Resolve one file for history, rejecting ambiguity at every lookup layer."""
+    if file_id is not None:
+        pick = _file_by_id(client, file_id, name)
+    else:
+        name = name.strip() if name is not None else ''
+        if not name:
+            raise ValueError('历史版本命令需要任务名或 --file-id。')
+        matches = list_matching_files(client, name)
+        exact = [m for m in matches if (m.get('file_name') or '').lower() == name.lower()]
+        pick = _unique_candidate(exact or matches, name)
+        if pick is None:
+            node = _unique_candidate(get_nodes_by_output(client, name), name)
+            if node and node.get('node_name'):
+                node_name = node['node_name'].strip()
+                matches = list_matching_files(client, node_name)
+                exact = [m for m in matches if (m.get('file_name') or '').lower() == node_name.lower()]
+                pick = _unique_candidate(exact, node_name)
+                if pick and pick.get('node_id') != node.get('node_id'):
+                    raise TaskSqlNotFound('产出节点与同名文件 node_id 不一致；请指定 --file-id。')
+    if not pick or not pick.get('file_id'):
+        raise TaskSqlNotFound('找不到任务对应的 file_id，无法查版本历史。')
+    return {key: pick.get(key) for key in ('file_id', 'file_name', 'folder_path', 'node_id')}
 
 
 def list_task_versions(client, file_id):
@@ -477,6 +489,7 @@ def list_task_versions(client, file_id):
     page_size = 100
 
     while True:
+        from alibabacloud_dataworks_public20200518 import models as dataworks_models
         request = dataworks_models.ListFileVersionsRequest(
             project_id=DATAWORKS_PROJECT_ID,
             file_id=file_id,
@@ -518,6 +531,7 @@ def list_task_versions(client, file_id):
 
 def get_task_version_sql(client, file_id, version):
     """取指定历史版本的完整 SQL + 元信息。空内容/接口失败给干净报错。"""
+    from alibabacloud_dataworks_public20200518 import models as dataworks_models
     request = dataworks_models.GetFileVersionRequest(
         project_id=DATAWORKS_PROJECT_ID,
         file_id=file_id,
@@ -574,12 +588,9 @@ def cmd_fetch(args):
     try:
         if getattr(args, 'source', 'auto') == 'saved':
             result = fetch_saved_task(name=args.name, file_id=args.file_id)
-        elif getattr(args, 'file_id', None) is not None:
-            raise ValueError('--file-id 必须与 --source saved 一起使用。')
         else:
-            if not args.name:
-                raise ValueError('请提供表名/任务名，或使用 --source saved --file-id。')
-            result = fetch_task_sql(args.name)
+            result = fetch_task_sql(args.name, file_id=getattr(args, 'file_id', None),
+                                    node_id=getattr(args, 'node_id', None))
     except TaskSqlNotFound as e:
         print(f"[未找到] {e}", file=sys.stderr)
         print(
@@ -626,7 +637,7 @@ def cmd_search(args):
 
 def cmd_list_versions(args):
     client = create_client()
-    info = resolve_file_id(client, args.name)
+    info = resolve_file_id(client, args.name, file_id=getattr(args, 'file_id', None))
     versions = list_task_versions(client, info["file_id"])
     if not versions:
         print(f"任务 '{info['file_name']}' 没有历史版本记录。", file=sys.stderr)
@@ -663,7 +674,7 @@ def cmd_list_versions(args):
 
 def cmd_get_version(args):
     client = create_client()
-    info = resolve_file_id(client, args.name)
+    info = resolve_file_id(client, args.name, file_id=getattr(args, 'file_id', None))
     try:
         v = get_task_version_sql(client, info["file_id"], args.get_version)
     except TaskSqlNotFound as e:
@@ -696,7 +707,7 @@ def cmd_get_version(args):
 
 def cmd_diff(args):
     client = create_client()
-    info = resolve_file_id(client, args.name)
+    info = resolve_file_id(client, args.name, file_id=getattr(args, 'file_id', None))
     va, vb = args.diff
     try:
         a = get_task_version_sql(client, info["file_id"], va)
@@ -738,7 +749,9 @@ def build_parser():
     p.add_argument("name", nargs="?", help="表名或任务名；--source saved 时须精确任务名，可仅指定 --file-id")
     p.add_argument("--source", choices=('auto', 'saved'), default='auto',
                    help="auto=生产优先、开发兜底（原行为）；saved=严格获取 GetFile 保存态")
-    p.add_argument("--file-id", type=int, help="保存态文件 ID；与 --source saved 搭配，若同时提供 name 会核对名称")
+    ids = p.add_mutually_exclusive_group()
+    ids.add_argument('--file-id', type=int, help='精确文件 ID；支持自动取码、保存态和历史版本，提供 name 时核对名称')
+    ids.add_argument('--node-id', type=int, help='精确生产节点 ID；仅直接获取生产代码，不能与 name 或其他模式混用')
     p.add_argument("--save", help="把代码落盘（SQL 建议 .sql，PyODPS3 建议 .py）")
 
     mode = p.add_mutually_exclusive_group()
@@ -776,10 +789,14 @@ def main():
     args = build_parser().parse_args()
     try:
         specialized_mode = args.search or args.list_versions or args.get_version is not None or args.diff is not None
-        if specialized_mode and (args.source != 'auto' or args.file_id is not None):
-            raise ValueError('--source saved / --file-id 不与搜索、历史版本命令混用。')
-        if specialized_mode and not args.name:
-            raise ValueError('搜索、历史版本命令必须提供 name。')
+        if args.node_id is not None and (args.name is not None or args.source != 'auto' or specialized_mode):
+            raise ValueError('--node-id 仅用于直接取生产态代码，不能与 name、保存态、搜索或历史版本混用。')
+        if specialized_mode and args.source != 'auto':
+            raise ValueError('--source saved 不与搜索、历史版本命令混用。')
+        if args.search and (not args.name or args.file_id is not None):
+            raise ValueError('--search 必须提供 name，且不能与 --file-id 混用。')
+        if specialized_mode and not args.name and args.file_id is None:
+            raise ValueError('搜索、历史版本命令必须提供 name 或 --file-id。')
         if args.search:
             cmd_search(args)
         elif args.list_versions:

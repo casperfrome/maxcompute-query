@@ -6,19 +6,17 @@
 """
 import argparse
 import ast
-from contextlib import contextmanager
 from datetime import datetime, timezone
 import difflib
 import hashlib
 import json
-import os
 from pathlib import Path
 import sys
 import uuid
 
 import debug_pyodps3 as debug
 from pyodps3_runtime import (APIError, DataWorksAPI, build_adhoc_request,
-    resolve_runtime, observe_configuration, write_json, redacted_object, redact)
+    resolve_runtime, observe_configuration, write_json, redacted_object, redact, session_lock)
 
 
 def file_hash(path):
@@ -28,33 +26,6 @@ def file_hash(path):
 def read_json(path):
     return json.loads(Path(path).read_text(encoding='utf-8'))
 
-
-@contextmanager
-def session_lock(root):
-    """OS-owned lock: a crashed process releases it; an existing file is not a lock."""
-    path = Path(root) / '.session.lock'
-    with path.open('a+b') as handle:
-        handle.seek(0, 2)
-        if handle.tell() == 0:
-            handle.write(b'\0'); handle.flush()
-        handle.seek(0)
-        try:
-            if os.name == 'nt':
-                import msvcrt
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            raise ValueError('会话正在由另一个进程处理；不得另建目录重复提交') from None
-        try:
-            yield
-        finally:
-            handle.seek(0)
-            if os.name == 'nt':
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def load_session(root):
@@ -250,6 +221,8 @@ def classify_attempt(folder, manifest, traceback_review=None):
         manifest['repair_state'] = 'evidence_mismatch'
     elif analysis.get('possibly_truncated') or analysis.get('capture_partial'):
         manifest['repair_state'] = 'partial_log'
+    elif analysis.get('traceback_parse_status') == 'unknown':
+        manifest['repair_state'] = 'needs_diagnosis'
     elif manifest.get('remote_status') == 'Failure':
         diagnoses = analysis.get('diagnoses', [])
         if 'permission_possible' in diagnoses or not analysis.get('exceptions'):
@@ -581,7 +554,7 @@ def main(argv=None):
         if result.get('wait_timed_out'): return 7
         if result.get('remote_status') == 'Failure': return 1
         if result.get('execution_code_match') is False or result.get('configuration_match') is False: return 6
-        if result.get('repair_state') in ('needs_traceback_review', 'partial_log', 'evidence_mismatch', 'execution_unverified'): return 8
+        if result.get('repair_state') in ('needs_traceback_review', 'needs_diagnosis', 'partial_log', 'evidence_mismatch', 'execution_unverified'): return 8
         return 0
     except APIError as exc:
         print('[DataWorks API] ' + str(exc), file=sys.stderr); return 5

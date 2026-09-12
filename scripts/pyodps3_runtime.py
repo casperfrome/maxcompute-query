@@ -11,7 +11,36 @@ import tempfile
 import time
 import uuid
 
-import config
+import runtime_config as config
+from contextlib import contextmanager
+
+
+@contextmanager
+def session_lock(root):
+    """OS-owned lock: a crashed process releases it; an existing file is not a lock."""
+    path = Path(root) / '.session.lock'
+    with path.open('a+b') as handle:
+        handle.seek(0, 2)
+        if handle.tell() == 0:
+            handle.write(b'\0'); handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise ValueError('会话正在由另一个进程处理；不得另建目录重复提交') from None
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == 'nt':
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 class APIError(RuntimeError):
@@ -46,9 +75,9 @@ class DataWorksAPI:
     @property
     def modern(self):
         if self._modern is None:
+            config.validate_connection('dataworks')
             from alibabacloud_dataworks_public20240518.client import Client
             from alibabacloud_tea_openapi.models import Config
-            config.require_credentials()
             self._modern = Client(Config(access_key_id=config.ACCESS_ID, access_key_secret=config.SECRET,
                                          endpoint=config.DATAWORKS_ENDPOINT))
         return self._modern
@@ -342,13 +371,19 @@ def bizdate_millis(value):
 
 def build_parameters(saved, overrides, bizdate):
     bizdate_millis(bizdate)
-    parameters = {}
-    for pair in shlex.split(saved or '') + list(overrides or []):
-        key, sep, value = pair.partition('=')
-        if not sep or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key):
-            raise ValueError('参数必须为 KEY=VALUE：' + redact(pair))
-        parameters[key] = value
-    explicit = dict(pair.split('=', 1) for pair in (overrides or []))
+    def parse_source(pairs, source):
+        result = {}
+        for pair in pairs:
+            key, sep, value = pair.partition('=')
+            if not sep or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key):
+                raise ValueError('参数必须为 KEY=VALUE：' + redact(pair))
+            if key in result and result[key] != value:
+                raise ValueError('%s 参数 %s 重复且值冲突' % (source, key))
+            result[key] = value
+        return result
+    parameters = parse_source(shlex.split(saved or ''), '保存态')
+    explicit = parse_source(list(overrides or []), '显式')
+    parameters.update(explicit)
     if 'bizdate' in explicit and explicit['bizdate'] != bizdate:
         raise ValueError('--param bizdate 与 --bizdate 不一致')
     parameters['bizdate'] = bizdate

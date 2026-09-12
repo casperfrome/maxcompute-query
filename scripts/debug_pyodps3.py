@@ -15,10 +15,10 @@ import sys
 import time
 import uuid
 
-import config
+import runtime_config as config
 from pyodps3_log_utils import normalize_log, extract_tracebacks, render_log
 from pyodps3_runtime import (sha256, redact, redacted_object, APIError, DataWorksAPI,
-    bizdate_millis, build_parameters, write_json, new_bundle, load_manifest, save_manifest,
+    bizdate_millis, build_parameters, session_lock, write_json, new_bundle, load_manifest, save_manifest,
     resolve_resource, build_adhoc_request)
 
 
@@ -68,7 +68,8 @@ def analyze_log(raw, partial=False):
     if versions['python'] is None and path_python:
         versions['python'] = path_python.group(1)
     tracebacks, exceptions = extract_tracebacks(normalized, redact)
-    diagnoses = []
+    parse_status = 'unknown' if any(b.get('parse_status') == 'unknown' for b in tracebacks) else 'complete'
+    diagnoses = ['exception_group_incomplete'] if parse_status == 'unknown' else []
     if 'groupby' in normalized and "unexpected keyword argument 'dropna'" in normalized:
         diagnoses.append('pandas_groupby_api')
     if '平台连接项目必须为' in normalized or ('project' in normalized.lower() and 'tst_mc_prod_dev' in normalized):
@@ -94,6 +95,7 @@ def analyze_log(raw, partial=False):
         elif re.search(r'日志.{0,8}(?:已.{0,3}清理|已.{0,3}删除|已过期)|log.{0,24}(?:has expired|was deleted|has been (?:deleted|removed))', line, re.I):
             truncation_evidence.append({'kind': 'platform_retention', 'detail': redact(line)})
     return {'versions': versions, 'exceptions': exceptions, 'tracebacks': tracebacks,
+            'traceback_parse_status': parse_status,
             'user_code_lines': sorted(set(int(x) for x in re.findall(
                 r'File\s+["\']<pyodps_user_code>["\'],\s*line\s+(\d+)', normalized))),
             'exit_codes': [int(x) for x in re.findall(r'Exit code of the Shell command\s+(-?\d+)', normalized)],
@@ -142,47 +144,48 @@ def inspect_saved(api, name=None, file_id=None, bizdate=None, overrides=None, ou
 
 def submit_saved(api, bundle):
     bundle = Path(bundle)
-    manifest = load_manifest(bundle)
-    if manifest['submission_status'] != 'not_started':
-        raise ValueError('此快照已经尝试运行，禁止重复提交；请使用 status/logs 核实已有运行')
-    source = (bundle / 'snapshot.py').read_bytes().decode('utf-8')
-    if sha256(source) != manifest['code_sha256']:
-        raise ValueError('本地代码快照哈希改变，不能宣称原样执行保存态')
-    saved = json.loads((bundle / 'snapshot.json').read_text(encoding='utf-8'))
-    try:
-        date_ms = bizdate_millis(manifest['bizdate'])
-        if not saved.get('owner') or not saved.get('connection_name'):
-            raise ValueError('保存配置缺少 Owner/ConnectionName，不能猜测运行配置')
-        resource = resolve_resource(api, saved)
-    except (ValueError, APIError) as exc:
-        manifest.update(submission_status='blocked', error=redact(str(exc)))
+    with session_lock(bundle):
+        manifest = load_manifest(bundle)
+        if manifest['submission_status'] != 'not_started':
+            raise ValueError('此快照已经尝试运行，禁止重复提交；请使用 status/logs 核实已有运行')
+        source = (bundle / 'snapshot.py').read_bytes().decode('utf-8')
+        if sha256(source) != manifest['code_sha256']:
+            raise ValueError('本地代码快照哈希改变，不能宣称原样执行保存态')
+        saved = json.loads((bundle / 'snapshot.json').read_text(encoding='utf-8'))
+        try:
+            date_ms = bizdate_millis(manifest['bizdate'])
+            if not saved.get('owner') or not saved.get('connection_name'):
+                raise ValueError('保存配置缺少 Owner/ConnectionName，不能猜测运行配置')
+            resource = resolve_resource(api, saved)
+        except (ValueError, APIError) as exc:
+            manifest.update(submission_status='blocked', error=redact(str(exc)))
+            save_manifest(bundle, manifest)
+            raise
+        runtime = {'ResourceGroupId': resource['identifier']}
+        for old, new in [('ImageId', 'Image'), ('Cu', 'Cu')]:
+            value = saved.get('node_configuration', {}).get(old)
+            if value is not None and value != '':
+                runtime[new] = str(value)
+        unique = uuid.uuid4().hex
+        request = build_adhoc_request(project_id=manifest['project_id'], task_name=saved['task_name'],
+            owner=saved['owner'], bizdate=manifest['bizdate'], parameters=manifest['parameters'],
+            source=source, runtime_resource=runtime, data_source={'Name': saved['connection_name']}, unique_code=unique)
+        write_json(bundle / 'request.json', request)
+        write_json(bundle / 'resource_mapping.json', resource)
+        manifest.update(submission_status='submitting', workflow_name=request['Name'])
+        save_manifest(bundle, manifest)  # A crash after this point never causes an automatic re-submit.
+        try:
+            response = api.call('ExecuteAdhocWorkflowInstance', request)
+            if not response.get('WorkflowInstanceId'):
+                raise APIError('ExecuteAdhocWorkflowInstance', None, '响应没有 WorkflowInstanceId，提交结果不确定')
+        except APIError as exc:
+            manifest.update(submission_status='rejected' if exc.definite_rejection else 'unknown', error=str(exc))
+            save_manifest(bundle, manifest)
+            raise
+        manifest.update(submission_status='submitted', workflow_instance_id=response['WorkflowInstanceId'],
+                        submit_request_id=response.get('RequestId'))
         save_manifest(bundle, manifest)
-        raise
-    runtime = {'ResourceGroupId': resource['identifier']}
-    for old, new in [('ImageId', 'Image'), ('Cu', 'Cu')]:
-        value = saved.get('node_configuration', {}).get(old)
-        if value is not None and value != '':
-            runtime[new] = str(value)
-    unique = uuid.uuid4().hex
-    request = build_adhoc_request(project_id=manifest['project_id'], task_name=saved['task_name'],
-        owner=saved['owner'], bizdate=manifest['bizdate'], parameters=manifest['parameters'],
-        source=source, runtime_resource=runtime, data_source={'Name': saved['connection_name']}, unique_code=unique)
-    write_json(bundle / 'request.json', request)
-    write_json(bundle / 'resource_mapping.json', resource)
-    manifest.update(submission_status='submitting', workflow_name=request['Name'])
-    save_manifest(bundle, manifest)  # A crash after this point never causes an automatic re-submit.
-    try:
-        response = api.call('ExecuteAdhocWorkflowInstance', request)
-        if not response.get('WorkflowInstanceId'):
-            raise APIError('ExecuteAdhocWorkflowInstance', None, '响应没有 WorkflowInstanceId，提交结果不确定')
-    except APIError as exc:
-        manifest.update(submission_status='rejected' if exc.definite_rejection else 'unknown', error=str(exc))
-        save_manifest(bundle, manifest)
-        raise
-    manifest.update(submission_status='submitted', workflow_instance_id=response['WorkflowInstanceId'],
-                    submit_request_id=response.get('RequestId'))
-    save_manifest(bundle, manifest)
-    return manifest
+        return manifest
 
 
 def discover_instance(api, manifest):
