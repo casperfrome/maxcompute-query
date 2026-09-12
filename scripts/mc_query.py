@@ -22,6 +22,8 @@ mc_query.py — MaxCompute / ODPS 数仓排查取数辅助工具
 ALTER/CREATE/TRUNCATE/MERGE/...）直接拒绝退出。本工具只用于排查取数，不改数。
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import re
@@ -45,9 +47,8 @@ except Exception:
 # 把脚本所在目录加入 import 路径，确保以文件方式直接运行时也能 import 同目录的 config
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import config  # noqa: E402  # 连接凭证/端点的单一来源（可用环境变量覆盖）
-from odps import ODPS  # noqa: E402
-from odps.errors import ODPSError  # noqa: E402
+import runtime_config as config  # noqa: E402
+from sql_utils import Query, mask_literals as _mask_literals, partition_constrained, tokenize
 
 # 打印结果时的默认行数上限（保护超大结果集，可用 --max-rows 调整）
 DEFAULT_MAX_PRINT_ROWS = 200
@@ -154,130 +155,56 @@ def assert_readonly(sql: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 分区过滤静态检查（痛点 4）
+# 分区过滤静态检查：绑定每次关系引用及其作用域；失败显式返回未知。
 # ---------------------------------------------------------------------------
-# 只读校验只管「是不是写操作」，不管「扫了多少分区」。漏分区过滤的查询会全表扫描——又慢又贵，
-# 是排查时最易踩的雷，尤其是把多 tmp 链路重构成的长 WITH（FROM 里十几张大表，漏一张就烧钱）。
-# 下面这组纯函数在执行前做一道 best-effort 静态体检：找出 FROM/JOIN 的真实分区表、检查其分区列
-# 有没有在查询里作为过滤出现，缺了就提示。它是「提早、清晰地报警」，不追求 100% 精确——
-# 宁可漏报（少数复杂查询没拦住，运行时 MaxCompute 一般也会对全表扫描兜底报错），不可误伤
-# （把 CTE/别名/子查询误判成缺过滤的表，逼用户加无意义的过滤）。
-
-
-def _mask_literals(sql: str) -> str:
-    """返回与原串**等长**的掩码串：注释与字符串/反引号字面量的内容替换为空格，但保留分号、
-    括号、关键字、标识符等结构字符**与原始字符偏移**。
-
-    与 `_scrub_for_check` 的区别：那个会把注释/串折叠（长度改变），只够做切分与查词；这个保长，
-    所以可以拿掩码里的位置直接回原文切片——语句切分、表引用提取、build_validation_sql.py 的
-    tmp 链转写都依赖这点。两者状态机一致：都不会被串内的 `;`/`--`/写词，或反引号保留字列名误导。
-    """
-    out = list(sql)
-    i, n = 0, len(sql)
-    while i < n:
-        two = sql[i:i + 2]
-        if two == "--":                      # 行注释 → 抹到行尾（保留换行）
-            j = sql.find("\n", i)
-            end = n if j == -1 else j
-            for k in range(i, end):
-                out[k] = " "
-            i = end
-            continue
-        if two == "/*":                      # 块注释 → 抹掉（保留长度）
-            j = sql.find("*/", i + 2)
-            end = n if j == -1 else j + 2
-            for k in range(i, end):
-                out[k] = " "
-            i = end
-            continue
-        c = sql[i]
-        if c in "'\"":                       # 字符串字面量 → 内容抹空，保留引号
-            q = c
-            i += 1
-            while i < n:
-                if sql[i] == "\\" and i + 1 < n:
-                    out[i] = " "
-                    out[i + 1] = " "
-                    i += 2
-                    continue
-                if sql[i] == q:
-                    if q == "'" and sql[i + 1:i + 2] == "'":
-                        out[i] = " "
-                        out[i + 1] = " "
-                        i += 2
-                        continue
-                    break
-                out[i] = " "
-                i += 1
-            i += 1                           # 跳过闭合引号（保留）
-            continue
-        if c == "`":                         # 反引号标识符内容 → 抹空，保留反引号
-            i += 1
-            while i < n and sql[i] != "`":
-                out[i] = " "
-                i += 1
-            i += 1
-            continue
-        i += 1
-    return "".join(out)
-
-
 def extract_table_refs(sql: str):
-    """从 SQL 里提取 (CTE 名集合, FROM/JOIN 后的真实表引用列表)。基于掩码，避免被串/注释干扰。
-
-    - CTE 名：`WITH a AS (...), b AS (...)` 里的 a/b——用来从表引用里排除掉（它们不是物理表）。
-    - 表引用：`FROM x` / `JOIN x` 后紧跟的标识符；后面是 `(` 的是子查询，不算表。
-    宁可把可疑的当成 CTE 多排除（顶多漏报），也不把 CTE 当成表（会误伤）。
-    """
-    mask = _mask_literals(sql)
-    cte_names = {m.group(1).lower() for m in re.finditer(r"\b([A-Za-z_]\w*)\s+AS\s*\(", mask)}
-    refs = []
-    for m in re.finditer(r"\b(?:FROM|JOIN)\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)", mask):
-        refs.append(m.group(1))
-    # 去重保序
-    seen, uniq = set(), []
-    for r in refs:
-        if r.lower() not in seen:
-            seen.add(r.lower())
-            uniq.append(r)
-    return cte_names, uniq
+    query = Query(sql)
+    names = {d.token.name.lower() for d in query.definitions}
+    refs = list(dict.fromkeys('.'.join(rel.parts) for _, rel in query.physical))
+    return names, refs
 
 
 def check_partition_filters(odps, sql):
-    """对每张被引用的真实分区表，检查其分区列是否在查询里出现过过滤；返回告警列表。
-
-    判定「出现过过滤」用的是粗粒度启发式：分区列名只要在掩码里任意位置出现即视为已过滤
-    （多表查询里各表常各带自己的 ds 过滤，精确绑定到具体表代价高且易误伤，这里从宽）。
-    每条告警是 (表名, 全部分区列, 缺失的分区列)。表不存在/解析不到的当作 CTE/别名跳过。
-    """
-    mask = _mask_literals(sql)
-    cte_names, refs = extract_table_refs(sql)
-    warnings_out = []
-    for t in refs:
-        if t.lower() in cte_names:
+    """Return issue dictionaries; metadata/parser failures must not imply safety."""
+    try:
+        tokens = tokenize(sql)
+        if tokens and tokens[0].word in ('DESC', 'DESCRIBE', 'SHOW'):
+            return []
+        if tokens and tokens[0].word == 'EXPLAIN':
+            sql = sql[tokens[0].end:]
+        query = Query(sql)
+    except ValueError as exc:
+        return [dict(table='<查询>', status='未知', reason=str(exc), missing=[])]
+    project = getattr(odps, 'project', None)
+    issues, metadata = [], {}
+    for scope, relation in query.physical:
+        table = '.'.join(relation.parts)
+        if table not in metadata:
+            try:
+                if not odps.exist_table(table):
+                    raise ValueError('表不存在或不可访问')
+                metadata[table] = [p.name for p in odps.get_table(table).table_schema.partitions]
+            except Exception:
+                metadata[table] = None
+        columns = metadata[table]
+        if columns is None:
+            issues.append(dict(table=table, status='未知', reason='无法读取分区元数据', missing=[]))
             continue
-        try:
-            if not odps.exist_table(t):
-                continue
-            tbl = odps.get_table(t)
-        except Exception:
-            continue
-        parts = tbl.table_schema.partitions
-        if not parts:
-            continue
-        pcols = [p.name for p in parts]
-        missing = [pc for pc in pcols
-                   if not re.search(r"\b" + re.escape(pc) + r"\b", mask, re.I)]
+        missing = [column for column in columns if not any(
+            partition_constrained(query, scope, relation, column, start, end, project)
+            for start, end in relation.predicates)]
         if missing:
-            warnings_out.append((t, pcols, missing))
-    return warnings_out
+            issues.append(dict(table=table, status='缺失', reason='未识别到限定该表的分区谓词',
+                               missing=missing, alias=relation.alias))
+    return issues
 
 
 # ---------------------------------------------------------------------------
 # ODPS 连接 & 取数
 # ---------------------------------------------------------------------------
 def get_odps() -> ODPS:
-    config.require_credentials()
+    config.validate_connection('odps')
+    from odps import ODPS
     return ODPS(
         access_id=config.ACCESS_ID,
         secret_access_key=config.SECRET,
@@ -354,6 +281,7 @@ def execute_or_report(odps: ODPS, sql: str):
     这样调用方（写 SQL 的 Claude）看到的是结构化的报错+出错 SQL，而不是一坨
     Python traceback，便于读懂错误、自己改 SQL 再重试。返回 (DataFrame, meta)。
     """
+    from odps.errors import ODPSError
     try:
         return run_select_df(odps, sql)
     except ODPSError as e:
@@ -641,11 +569,11 @@ def cmd_sql(args):
     if not args.allow_full_scan:
         warns = check_partition_filters(odps, sql)
         if warns:
-            print("[分区过滤告警] 以下分区表疑似缺少分区过滤，可能触发全表扫描（又慢又贵）：",
+            print("[分区过滤告警] 以下关系的分区过滤缺失或未知，可能触发全表扫描：",
                   file=sys.stderr)
-            for t, pcols, missing in warns:
-                print(f"  - {t}：分区列 {pcols}，缺过滤 {missing}"
-                      f"（按 {missing[0]}=MAX_PT('{t}') 或具体分区补上）", file=sys.stderr)
+            for issue in warns:
+                detail = f"，缺过滤 {issue['missing']}" if issue['missing'] else ''
+                print(f"  - {issue['table']}：{issue['status']}，{issue['reason']}{detail}", file=sys.stderr)
             if args.strict:
                 print("[--strict] 存在分区过滤告警，已拒绝执行。确认要全表扫描请加 --allow-full-scan。",
                       file=sys.stderr)

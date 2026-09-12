@@ -1,36 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-build_validation_sql.py — 把「在线数仓任务代码」改写成可只读验证的 SQL（本身不连库、不执行）
-
-它解决两件事，对应 maxcompute-query skill 的两个痛点：
-
-  inline   把含多个 tmp 中间表的任务正文（DROP/CREATE TABLE AS/INSERT OVERWRITE tmp 链路）
-           机械转成**单条只读 `WITH ... SELECT`**，让你能用真实数据端到端验证任务逻辑，而不是
-           人肉把链路重写一遍（人肉翻译正是最容易引入错误、让你验的是「脑补的等价版」的地方）。
-
-  compare  生成「改前 vs 改后」双跑对照 SQL：FULL OUTER JOIN on 唯一键，分桶统计
-           仅旧有 / 仅新有 / 键同值不同 / 完全一致——证明重构没把数据改坏的最硬证据。
-           这条 SQL 的 NULL 判断和 FULL OUTER JOIN 极易手写出错，故用生成器固化。
-
-两个子命令都**只吐 SQL 文本**。生成物要验证时，喂给 `mc_query.py sql -f`（仍走只读校验+分区体检）。
-
-  python build_validation_sql.py inline task.sql                     # 转成单条 WITH 打到 stdout
-  python build_validation_sql.py inline task.sql --list-vars         # 只列出 ${...} 变量占位符
-  python build_validation_sql.py inline task.sql --var bizdate=20260620 --save inlined.sql
-  python build_validation_sql.py inline task.sql --target tmp_xxx     # 只验证到某张中间表
-  python build_validation_sql.py compare old.sql new.sql --key request_id,file_id,node_oper \
-         --measure operate_time,if_read
-
-设计取舍（保守转写，绝不静默猜）：能干净机械转的（线性 CTAS / INSERT OVERWRITE tmp 链）自动转；
-吃不准的片段（同名 tmp 多次写入、动态分区写 tmp、引用了尚未定义的 tmp=疑似依赖顺序倒置、
-非 SELECT 体写语句）**在 stderr 显式标记出来让人确认**，并尽量按原文保留以忠实复现，不替你拍板。
-"""
-
+"""Conservative read-only SQL generation. No service connections."""
 import argparse
 import os
+import tempfile
 import re
 import sys
+from pathlib import Path
+from sql_utils import Query, tokenize, identifier_path, is_identifier, quote_identifier, table_identity
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -38,417 +15,324 @@ try:
 except Exception:
     pass
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mc_query import _mask_literals  # noqa: E402  # 复用「等长掩码」做结构感知的切分/查词
+
+def split_statements(sql):
+    statements, start = [], 0
+    for token in tokenize(sql):
+        if token.text == ';':
+            part = sql[start:token.start].strip()
+            if tokenize(part):
+                statements.append(part)
+            start = token.end
+    part = sql[start:].strip()
+    if tokenize(part):
+        statements.append(part)
+    return statements
 
 
-# ---------------------------------------------------------------------------
-# 语句切分 / 结构工具（都基于等长掩码，按原文偏移切片）
-# ---------------------------------------------------------------------------
-def split_statements(sql: str):
-    """按顶层 `;`（不在字符串/注释/括号内）把 SQL 切成语句列表，丢掉纯注释/空白语句。返回原文片段。"""
-    mask = _mask_literals(sql)
-    stmts, start = [], 0
-    for m in re.finditer(r";", mask):
-        idx = m.start()
-        if mask[start:idx].strip():
-            stmts.append(sql[start:idx].strip())
-        start = idx + 1
-    if mask[start:].strip():
-        stmts.append(sql[start:].strip())
-    return stmts
+def find_vars(sql):
+    return list(dict.fromkeys(re.findall(r'\$\{([^{}]*)\}', sql)))
 
 
-def _match_paren(mask: str, i: int) -> int:
-    """mask[i] 是 '('，返回与之匹配的 ')' 的下标；找不到返回 -1。"""
-    depth, n = 0, len(mask)
-    while i < n:
-        if mask[i] == "(":
-            depth += 1
-        elif mask[i] == ")":
-            depth -= 1
-            if depth == 0:
-                return i
-        i += 1
-    return -1
-
-
-def find_vars(sql: str):
-    """找出所有 ${name} 变量占位符（去重保序）。"""
-    seen, out = set(), []
-    for m in re.finditer(r"\$\{(\w+)\}", sql):
-        if m.group(1) not in seen:
-            seen.add(m.group(1))
-            out.append(m.group(1))
-    return out
-
-
-def apply_vars(sql: str, var_map: dict) -> str:
-    for k, v in var_map.items():
-        sql = sql.replace("${" + k + "}", v)
+def apply_vars(sql, var_map):
+    for name, value in var_map.items():
+        sql = sql.replace('$' + '{' + name + '}', value)
     return sql
 
 
-# ---------------------------------------------------------------------------
-# inline：tmp 链路 → 单条只读 WITH
-# ---------------------------------------------------------------------------
-class Cte:
-    __slots__ = ("name", "body", "written", "had_partition")
-
-    def __init__(self, name, body):
-        self.name = name
-        self.body = body          # None 表示是建表骨架，待后续 INSERT 填充
-        self.written = 0          # 被 INSERT 写入的次数
-        self.had_partition = False
+def _query(sql):
+    if '${' in sql:
+        raise ValueError('仍有未代入变量或不支持的变量表达式：' + ', '.join(find_vars(sql)))
+    model = Query(sql)
+    if model.tokens[0].word not in ('SELECT', 'WITH'):
+        raise ValueError('顶层查询必须直接以 SELECT/WITH 开始')
+    return model
 
 
-def _shorten_qualified_cte_refs(fragment: str, cte_short_names: dict) -> str:
-    """将已识别 CTE 的 schema-qualified 引用改为短名，不触碰串或注释。"""
-    if not cte_short_names:
-        return fragment
-    pattern = re.compile(
-        r"(?<![A-Za-z0-9_.])(?:[A-Za-z_]\w*\.)+(" + "|".join(
-            re.escape(name) for name in sorted(cte_short_names, key=len, reverse=True)
-        ) + r")(?![A-Za-z0-9_.])",
-        re.IGNORECASE,
-    )
-    mask = _mask_literals(fragment)
-    spans = [(m.start(), m.end(), cte_short_names[m.group(1).lower()])
-             for m in pattern.finditer(mask)]
-    out = fragment
-    for start, end, replacement in reversed(spans):
-        out = out[:start] + replacement + out[end:]
-    return out
+def _name(text):
+    tokens = tokenize(text)
+    parts, end, _ = identifier_path(tokens, 0, len(tokens))
+    if end != len(tokens) or len(parts) > 3:
+        raise ValueError('需要明确表名：' + text)
+    return parts
 
 
-def inline_task(sql: str, target: str = None):
-    """把任务正文转成单条 WITH。返回 (with_sql, warnings, cte_names, final_target)。"""
-    stmts = split_statements(sql)
-    ctes = []                     # 有序 Cte 列表
-    by_name = {}                  # name.lower() -> ctes 下标
-    warnings = []
-    final_target = None
-    final_body = None
+def _create(stmt):
+    tokens = tokenize(stmt)
+    if len(tokens) < 3 or [t.word for t in tokens[:2]] != ['CREATE', 'TABLE']:
+        raise ValueError('仅支持 CREATE TABLE AS SELECT')
+    if tokens[2].word == 'IF':
+        raise ValueError('CREATE IF NOT EXISTS 依赖物理表状态，无法保证等价')
+    parts, i, _ = identifier_path(tokens, 2, len(tokens))
+    tail = tokens[i:]
+    if len(tail) >= 2 and tail[0].word == 'LIFECYCLE' and tail[1].kind == 'number':
+        tail = tail[2:]
+    if not tail or tail[0].word != 'AS' or len(tail) < 2:
+        raise ValueError('显式列类型或其他建表选项暂不支持；请提供 CTAS 链路')
+    body = stmt[tail[0].end:].strip()
+    _query(body)
+    return parts, body
 
-    re_ctas = re.compile(
-        r"(?is)^\s*create\s+table\s+(?:if\s+not\s+exists\s+)?"
-        r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\b(.*?)\bas\b")
-    re_create_skel = re.compile(
-        r"(?is)^\s*create\s+table\s+(?:if\s+not\s+exists\s+)?"
-        r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\b")
-    re_insert = re.compile(
-        r"(?is)^\s*insert\s+(overwrite|into)\s+table\s+"
-        r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*(partition\s*\([^)]*\))?\s*")
-    re_drop = re.compile(r"(?is)^\s*drop\b")
 
-    def short(name):
-        return name.split(".")[-1]
+def inline_task(sql, target=None, project=None):
+    if project is None:
+        import runtime_config as config
+        project = config.ODPS_PROJECT or None
+    statements = split_statements(sql)
+    creates = {}
+    for stmt in statements:
+        if tokenize(stmt)[0].word == 'CREATE':
+            parts, body = _create(stmt)
+            key = table_identity(parts, project)
+            if key in creates:
+                raise ValueError('同一中间表被重复创建，不能保证等价')
+            creates[key] = parts
+    requested = table_identity(_name(target), project) if target else None
+    if requested is not None and requested not in creates:
+        available = ', '.join('.'.join(parts) for parts in creates.values())
+        raise ValueError(f'--target {target} 不在中间表列表中。可用：{available}')
+    definitions, mapping, dropped = [], {}, set()
+    used = {t.name.lower() for t in tokenize(sql) if is_identifier(t)}
+    final_body, final_target = None, None
 
-    for stmt in stmts:
-        mstmt = _mask_literals(stmt)
+    def convert(body):
+        model = _query(body)
+        for _, rel in model.physical:
+            key = table_identity(rel.parts, project)
+            if key in creates and key not in mapping:
+                raise ValueError('依赖顺序倒置或中间表尚未写入：' + '.'.join(rel.parts))
+        return model.rewrite(mapping=mapping, project=project)
 
-        if re_drop.match(mstmt):
-            continue                              # 清理语句，忽略
-
-        m = re_ctas.match(mstmt)
-        if m:
-            name = m.group(1)
-            body = stmt[m.end():].strip()
-            ctes.append(Cte(name, body))
-            by_name[short(name).lower()] = len(ctes) - 1
-            continue
-
-        m = re_insert.match(mstmt)
-        if m:
-            into_kind, tgt, part = m.group(1), m.group(2), m.group(3)
-            body = stmt[m.end():].strip()
-            key = short(tgt).lower()
-            if key in by_name:                    # 写的是某张 tmp
-                cte = ctes[by_name[key]]
-                if cte.body is None:              # 给骨架填充 body
-                    cte.body = body
-                    cte.written = 1
-                else:
-                    cte.written += 1
-                    warnings.append(
-                        f"⚠ tmp `{short(tgt)}` 被多次写入（第 {cte.written} 次，"
-                        f"{into_kind.upper()}）——CTE 无法表达 append/多次覆盖，已用最后一次的 body，"
-                        f"请人工确认这里是否真要合并多段写入。")
-                    cte.body = body
-                if part:
-                    cte.had_partition = True
-                    warnings.append(
-                        f"⚠ tmp `{short(tgt)}` 是带 PARTITION 的写入——CTE 不表达分区语义，"
-                        f"已忽略 PARTITION 子句，若依赖动态分区结果请人工确认。")
-                continue
-            # 写的是非 tmp 目标 → 最终产出
-            if final_target is not None:
-                warnings.append(
-                    f"⚠ 检测到多个最终输出目标（已有 `{short(final_target)}`，又见 `{short(tgt)}`），"
-                    f"已用最后一个作收尾，请人工确认。")
-            final_target, final_body = tgt, body
-            continue
-
-        if re_create_skel.match(mstmt):           # 无 AS 的建表骨架，等后续 INSERT 填充
-            name = re_create_skel.match(mstmt).group(1)
-            ctes.append(Cte(name, None))
-            by_name[short(name).lower()] = len(ctes) - 1
-            continue
-
-        kw = re.match(r"(?is)^\s*([A-Za-z_]+)", mstmt)
-        kw = kw.group(1).upper() if kw else "?"
-        if kw in ("SELECT", "WITH"):              # 裸 SELECT/WITH，当作收尾
-            final_target, final_body = None, stmt.strip()
-            continue
-        warnings.append(f"⚠ 跳过无法转写的语句（以 `{kw}` 开头）：{stmt[:60]}…")
-
-    # 骨架始终没被填充 body 的，剔除并告警
-    real = []
-    for c in ctes:
-        if c.body is None:
-            warnings.append(f"⚠ tmp `{short(c.name)}` 只有建表骨架、没找到对应 INSERT，已忽略。")
+    for stmt in statements:
+        tokens = tokenize(stmt)
+        first = tokens[0].word
+        if first == 'DROP':
+            i = 1
+            if i >= len(tokens) or tokens[i].word != 'TABLE':
+                raise ValueError('只支持中间表创建前的 DROP TABLE')
+            i += 1
+            if i + 1 < len(tokens) and tokens[i].word == 'IF' and tokens[i + 1].word == 'EXISTS':
+                i += 2
+            parts, i, _ = identifier_path(tokens, i, len(tokens))
+            key = table_identity(parts, project)
+            if i != len(tokens) or key not in creates or key in mapping or key in dropped:
+                raise ValueError('DROP 不是创建前的单次清理，无法保证等价')
+            dropped.add(key)
+        elif first == 'CREATE':
+            parts, body = _create(stmt)
+            key = table_identity(parts, project)
+            converted = convert(body)
+            base = '__inline_' + parts[-1]
+            name, suffix = base, 1
+            while name.lower() in used:
+                suffix += 1
+                name = base + '__' + str(suffix)
+            used.add(name.lower())
+            mapping[key] = name
+            definitions.append((key, name, converted))
+        elif first == 'INSERT':
+            if len(tokens) < 4 or [t.word for t in tokens[:3]] != ['INSERT', 'OVERWRITE', 'TABLE']:
+                raise ValueError('仅支持 INSERT OVERWRITE TABLE；追加写入不支持')
+            parts, i, _ = identifier_path(tokens, 3, len(tokens))
+            if i >= len(tokens) or tokens[i].word not in ('SELECT', 'WITH'):
+                raise ValueError('分区写入、目标列清单或该 INSERT 形式暂不支持')
+            if table_identity(parts, project) in creates:
+                raise ValueError('中间表多次写入，无法保证转写等价')
+            if final_body is not None:
+                raise ValueError('多个输出目标，无法生成单一对照结果')
+            final_body = convert(stmt[tokens[i].start:])
+            final_target = '.'.join(parts)
+        elif first in ('SELECT', 'WITH'):
+            if final_body is not None:
+                raise ValueError('多个最终输出查询，无法保证等价')
+            final_body = convert(stmt)
         else:
-            real.append(c)
-    ctes = real
-    by_name = {short(c.name).lower(): i for i, c in enumerate(ctes)}
-
-    # 依赖顺序体检：某 CTE body 里引用了「定义在它之后」的 tmp → 疑似依赖顺序倒置的 bug
-    for i, c in enumerate(ctes):
-        mbody = _mask_literals(c.body)
-        for tok in re.finditer(r"\b([A-Za-z_]\w*)\b", mbody):
-            j = by_name.get(tok.group(1).lower())
-            if j is not None and j > i:
-                warnings.append(
-                    f"⚠ tmp `{short(c.name)}` 在其定义处引用了尚未定义的 `{short(ctes[j].name)}`"
-                    f"（定义更靠后）——疑似依赖顺序倒置：线上会读到该表上一批的旧数据。"
-                    f"已按原文保留以忠实复现该 bug。")
-
-    # 选定收尾
-    if target:
-        key = short(target).lower()
-        if key not in by_name:
-            raise ValueError(
-                f"--target `{target}` 不在识别到的 tmp 列表里。可用：{[short(c.name) for c in ctes]}")
-        idx = by_name[key]
-        ctes = ctes[:idx + 1]
-        terminal = f"SELECT * FROM {ctes[idx].name}"
+            raise ValueError('无法可靠转写语句：' + (first or tokens[0].text))
+    if requested is not None:
+        index = next(i for i, (key, _, _) in enumerate(definitions) if key == requested)
+        definitions = definitions[:index + 1]
+        final_body = 'SELECT * FROM ' + quote_identifier(mapping[requested])
+        final_target = None
+    if final_body is None:
+        raise ValueError('未找到最终输出；可用 --target 指定已写入的中间表')
+    if Query(final_body).top_definitions and definitions:
+        raise ValueError('中间表链路的最终查询包含独立 WITH，暂不合并作用域')
+    if definitions:
+        head = ',\n'.join(quote_identifier(name) + ' AS (\n' + body + '\n)' for _, name, body in definitions)
+        result = 'WITH\n' + head + '\n' + final_body
     else:
-        if final_body is None:
-            raise ValueError(
-                "未找到最终输出语句（INSERT OVERWRITE 到非 tmp 目标或裸 SELECT）。"
-                "若想验证到某张中间表，请用 --target <tmp名>。")
-        terminal = final_body
+        result = final_body
+    _query(result)
+    return result, [], [name for _, name, _ in definitions], final_target
 
-    # CTE 名不能带 schema；把已识别 tmp 的限定引用同步改为短名，防止验证 SQL 回读物理 tmp。
-    cte_short_names = {short(c.name).lower(): short(c.name) for c in ctes}
-    for c in ctes:
-        c.body = _shorten_qualified_cte_refs(c.body, cte_short_names)
-        c.name = short(c.name)
-    terminal = _shorten_qualified_cte_refs(terminal, cte_short_names)
 
-    cte_names = [c.name for c in ctes]            # 反映最终（--target 切片后）实际入选的 CTE
-    if not ctes:
-        with_sql = terminal                       # 没有 tmp，原样就是只读查询
+def parse_with_query(sql):
+    model = _query(sql)
+    return [(d.token.name, sql[d.body_start:d.body_end].strip()) for d in model.top_definitions], sql[model.final_start:].strip().rstrip(';')
+
+
+def _lift(sql, prefix, used):
+    _query(sql)
+    for token in reversed(tokenize(sql)):
+        if token.text != ';':
+            break
+        sql = sql[:token.start] + sql[token.end:]
+    rewritten = _query(sql).rewrite(cte_prefix=prefix, reserved_names=used)
+    model = _query(rewritten)
+    return [rewritten[d.token.start:d.end] for d in model.top_definitions], rewritten[model.final_start:].strip().rstrip(';')
+
+
+def build_compare(old_sql, new_sql, keys, measures):
+    if not keys:
+        raise ValueError('至少提供一个唯一键列')
+    keys, measures = list(keys), list(measures)
+    for name in keys + measures:
+        tokens = tokenize(name)
+        if len(tokens) != 1 or not is_identifier(tokens[0]):
+            raise ValueError('比较列必须是单个列名：' + name)
+    normalized = [tokenize(k)[0].name.lower() for k in keys]
+    if len(set(normalized)) != len(keys):
+        raise ValueError('唯一键列不能重复')
+    key_sql = [quote_identifier(tokenize(k)[0].name, force=True) for k in keys]
+    measure_sql = [quote_identifier(tokenize(m)[0].name, force=True) for m in measures]
+    used = {t.name.lower() for t in tokenize(old_sql + '\n' + new_sql) if is_identifier(t)}
+    used.update(normalized + [tokenize(k)[0].name.lower() for k in measures])
+
+    def fresh(base):
+        name, number = base, 0
+        while name.lower() in used:
+            number += 1
+            name = base + '_' + str(number)
+        used.add(name.lower())
+        return name
+
+    old, new, issues, gate = [fresh(s) for s in ('__old', '__new', '__key_issues', '__key_gate')]
+    valid_old, valid_new = fresh('__old_valid'), fresh('__new_valid')
+    marker = fresh('__validation_present')
+    o_defs, o_final = _lift(old_sql, 'o_', used)
+    n_defs, n_final = _lift(new_sql, 'n_', used)
+    all_defs = o_defs + [f'{old} AS (\n{o_final}\n)'] + n_defs + [f'{new} AS (\n{n_final}\n)']
+    nulls = ' OR '.join(k + ' IS NULL' for k in key_sql)
+    key_list = ', '.join(key_sql)
+    checks = []
+    for table, side in ((old, '旧侧'), (new, '新侧')):
+        checks.extend([
+            f"SELECT '校验失败:{side}NULL键行数' AS diff_type, COUNT(*) AS cnt FROM {table} WHERE {nulls}",
+            f"SELECT '校验失败:{side}重复键组数' AS diff_type, COUNT(*) AS cnt FROM "
+            f"(SELECT {key_list} FROM {table} GROUP BY {key_list} HAVING COUNT(*)>1) duplicate_keys",
+        ])
+    all_defs.append(issues + ' AS (\n' + '\nUNION ALL\n'.join(checks) + '\n)')
+    all_defs.append(f'{gate} AS (SELECT SUM(cnt) AS errors FROM {issues})')
+    projections = list(dict.fromkeys(key_sql + measure_sql))
+    for source, name in ((old, valid_old), (new, valid_new)):
+        cols = ', '.join('s.' + col for col in projections)
+        all_defs.append(f'{name} AS (SELECT {cols}, 1 AS {marker} FROM {source} s '
+                        f'CROSS JOIN {gate} g WHERE g.errors=0)')
+    on = ' AND '.join('o.' + k + ' = n.' + k for k in key_sql)
+    if measure_sql:
+        differences = ' OR '.join(
+            f'((o.{m} IS NULL AND n.{m} IS NOT NULL) OR '
+            f'(o.{m} IS NOT NULL AND n.{m} IS NULL) OR o.{m} <> n.{m})' for m in measure_sql)
+        value_when = f"WHEN {differences} THEN '键同值不同'\n"
+        equal = '完全一致'
     else:
-        defs = ",\n".join(f"{c.name} AS (\n{c.body}\n)" for c in ctes)
-        with_sql = f"WITH\n{defs}\n{terminal}"
-    return with_sql, warnings, cte_names, final_target
-
-
-# ---------------------------------------------------------------------------
-# compare：改前/改后双跑对照
-# ---------------------------------------------------------------------------
-def parse_with_query(sql: str):
-    """把一段查询拆成 (cte_list[(name,body)], final_select)。裸 SELECT → ([], sql)。
-    解析失败返回 None（调用方据此退回「嵌套」兜底形式）。"""
-    sql = sql.strip().rstrip(";")
-    mask = _mask_literals(sql)
-    if not re.match(r"(?is)^\s*with\b", mask):
-        return [], sql
-    pos = re.match(r"(?is)^\s*with\b", mask).end()
-    ctes = []
-    while True:
-        m = re.match(r"(?is)^\s*([A-Za-z_]\w*)\s*(?:\([^()]*\))?\s*as\s*\(", mask[pos:])
-        if not m:
-            return None
-        name = m.group(1)
-        open_idx = pos + m.end() - 1
-        close_idx = _match_paren(mask, open_idx)
-        if close_idx == -1:
-            return None
-        ctes.append((name, sql[open_idx + 1:close_idx].strip()))
-        pos = close_idx + 1
-        m2 = re.match(r"(?is)^\s*,", mask[pos:])
-        if m2:
-            pos += m2.end()
-            continue
-        return ctes, sql[pos:].strip()
-
-
-def _prefix_idents(fragment: str, names: set, prefix: str) -> str:
-    """把 fragment 里出现的、属于 names 的标识符（定义处和引用处）统一加前缀。基于掩码，不碰串/注释。"""
-    mask = _mask_literals(fragment)
-    spans = [
-        (m.start(), m.end())
-        for m in re.finditer(r"\b[A-Za-z_]\w*\b", mask)
-        if m.group(0).lower() in names
-        and (m.start() == 0 or mask[m.start() - 1] != ".")
-        and (m.end() == len(mask) or mask[m.end()] != ".")
-    ]
-    out = fragment
-    for s, e in reversed(spans):
-        out = out[:s] + prefix + out[s:e] + out[e:]
-    return out
-
-
-def _lift(sql: str, prefix: str):
-    """把一段（可能是 WITH 的）查询提升成「带前缀的 CTE 定义片段 + 收尾别名」。
-    返回 (defs_list[str], final_select_str)；解析不了就退回嵌套形式（defs 为空，final 为子查询）。"""
-    parsed = parse_with_query(sql)
-    if parsed is None:
-        return [], f"(\n{sql.strip().rstrip(';')}\n)"   # 兜底：整体当子查询（可能触发嵌套 WITH，会告警）
-    ctes, final = parsed
-    names = {n.lower() for n, _ in ctes}
-    defs = []
-    for n, body in ctes:
-        defs.append(f"{prefix}{n} AS (\n{_prefix_idents(body, names, prefix)}\n)")
-    final = _prefix_idents(final, names, prefix)
-    return defs, final
-
-
-def build_compare(old_sql: str, new_sql: str, keys, measures):
-    """生成改前/改后对照 SQL（单条只读语句）。"""
-    o_defs, o_final = _lift(old_sql, "o_")
-    n_defs, n_final = _lift(new_sql, "n_")
-
-    nested_warn = ""
-    if (not o_defs and o_final.startswith("(")) or (not n_defs and n_final.startswith("(")):
-        nested_warn = ("-- ⚠ 有一侧无法解析为可合并的 WITH，已用子查询嵌套形式。"
-                       "若 MaxCompute 对嵌套 WITH 报错，请先用 mc_query 跑通各侧、或手工展开。\n")
-
-    all_defs = o_defs + [f"__old AS (\n{o_final}\n)"] + n_defs + [f"__new AS (\n{n_final}\n)"]
-    with_block = "WITH\n" + ",\n".join(all_defs)
-
-    on = " AND ".join(f"o.{k} = n.{k}" for k in keys)
-    k0 = keys[0]
-    if measures:
-        diff = " OR ".join(
-            f"((o.{m} IS NULL) <> (n.{m} IS NULL) OR o.{m} <> n.{m})" for m in measures)
-        value_when = f"           WHEN {diff} THEN '键同值不同'\n"
-        else_label = "完全一致"
-    else:
-        value_when = ""
-        else_label = "键匹配(未比较值，--measure 可加上)"
-
-    body = f"""{nested_warn}{with_block}
-SELECT diff_type, COUNT(*) AS cnt
-FROM (
+        value_when, equal = '', '键匹配(未比较值，--measure 可加上)'
+    return ('WITH\n' + ',\n'.join(all_defs) + f"""
+SELECT diff_type, cnt FROM {issues} WHERE cnt>0
+UNION ALL
+SELECT diff_type, COUNT(*) AS cnt FROM (
   SELECT CASE
-           WHEN o.{k0} IS NULL THEN '仅新增(新有旧无)'
-           WHEN n.{k0} IS NULL THEN '仅旧有(旧无新有)'
-{value_when}           ELSE '{else_label}'
-         END AS diff_type
-  FROM __old o
-  FULL OUTER JOIN __new n ON {on}
-) z
+    WHEN o.{marker} IS NULL THEN '仅新增(新有旧无)'
+    WHEN n.{marker} IS NULL THEN '仅旧有(旧有新无)'
+    {value_when}ELSE '{equal}'
+  END AS diff_type
+  FROM {valid_old} o FULL OUTER JOIN {valid_new} n ON {on}
+) compared
 GROUP BY diff_type
-ORDER BY cnt DESC"""
-    return body
+ORDER BY cnt DESC, diff_type""")
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 def _collect_vars(pairs):
-    var_map = {}
-    for p in pairs or []:
-        if "=" not in p:
-            print(f"[错误] --var 需写成 k=v，收到：{p}", file=sys.stderr)
-            sys.exit(2)
-        k, v = p.split("=", 1)
-        var_map[k.strip()] = v
-    return var_map
+    result = {}
+    for pair in pairs or []:
+        key, sep, value = pair.partition('=')
+        if not sep or not re.fullmatch(r'\w+', key):
+            raise ValueError('--var 需要 name=value')
+        if key in result and result[key] != value:
+            raise ValueError('--var 重复且值冲突：' + key)
+        result[key] = value
+    return result
 
 
-def _emit(sql, warnings, vars_left, save):
-    for w in warnings:
-        print(w, file=sys.stderr)
-    if vars_left:
-        print(f"\n⚠ 仍有未代入的变量占位符 {['${' + v + '}' for v in vars_left]}，"
-              f"用 --var k=v 代入后才能执行（如 --var bizdate=20260620）。", file=sys.stderr)
+def _emit(sql, save):
+    _query(sql)
     if save:
-        with open(save, "w", encoding="utf-8") as f:
-            f.write(sql)
-        print(f"（已写出 {len(sql)} 字符至 {save}）", file=sys.stderr)
+        target = Path(save)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', newline='\n',
+                    dir=target.parent, prefix='.' + target.name + '.', suffix='.tmp', delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(sql)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        print(f'已写出 {len(sql)} 字符至 {save}', file=sys.stderr)
     else:
         print(sql)
 
 
 def cmd_inline(args):
-    with open(args.file, encoding="utf-8") as f:
-        sql = f.read()
-
+    sql = Path(args.file).read_text(encoding='utf-8-sig')
     if args.list_vars:
-        vs = find_vars(sql)
-        print("变量占位符：" + (", ".join("${" + v + "}" for v in vs) if vs else "（无）"))
+        print('变量占位符：' + ', '.join(find_vars(sql)))
         return
-
-    with_sql, warnings, cte_names, final_target = inline_task(sql, target=args.target)
-    if cte_names:
-        print(f"识别到 {len(cte_names)} 张 tmp："
-              f"{[n.split('.')[-1] for n in cte_names]}", file=sys.stderr)
-    with_sql = apply_vars(with_sql, _collect_vars(args.var))
-    _emit(with_sql, warnings, find_vars(with_sql), args.save)
+    sql = apply_vars(sql, _collect_vars(args.var))
+    result, _, _, _ = inline_task(sql, target=args.target, project=getattr(args, 'project', None))
+    _emit(result, args.save)
 
 
 def cmd_compare(args):
-    with open(args.old, encoding="utf-8") as f:
-        old_sql = f.read()
-    with open(args.new, encoding="utf-8") as f:
-        new_sql = f.read()
-    keys = [k.strip() for k in args.key.split(",") if k.strip()]
-    measures = [m.strip() for m in (args.measure or "").split(",") if m.strip()]
-    if not keys:
-        print("[错误] --key 不能为空，至少给一个唯一键列。", file=sys.stderr)
-        sys.exit(2)
-    sql = build_compare(old_sql, new_sql, keys, measures)
-    sql = apply_vars(sql, _collect_vars(args.var))
-    _emit(sql, [], find_vars(sql), args.save)
+    variables = _collect_vars(args.var)
+    old = apply_vars(Path(args.old).read_text(encoding='utf-8-sig'), variables)
+    new = apply_vars(Path(args.new).read_text(encoding='utf-8-sig'), variables)
+    keys = [k.strip() for k in args.key.split(',') if k.strip()]
+    measures = [m.strip() for m in (args.measure or '').split(',') if m.strip()]
+    _emit(build_compare(old, new, keys, measures), args.save)
 
 
 def build_parser():
-    p = argparse.ArgumentParser(
-        description="把在线数仓任务改写成可只读验证的 SQL（只生成文本，不连库、不执行）")
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    si = sub.add_parser("inline", help="tmp 链路任务正文 → 单条只读 WITH")
-    si.add_argument("file", help="任务 SQL 文件（如 fetch_task_sql.py 落盘的 .sql）")
-    si.add_argument("--target", help="只验证到某张中间 tmp（默认转到最终产出）")
-    si.add_argument("--list-vars", action="store_true", help="只列出 ${...} 变量占位符后退出")
-    si.add_argument("--var", action="append", help="代入变量，写成 k=v，可重复（如 --var bizdate=20260620）")
-    si.add_argument("--save", help="把生成的 SQL 落盘到该路径")
-    si.set_defaults(func=cmd_inline)
-
-    sc = sub.add_parser("compare", help="改前/改后双跑对照 SQL（FULL OUTER JOIN on 唯一键）")
-    sc.add_argument("old", help="改前逻辑的 SQL 文件（通常是 inline 旧任务的产物）")
-    sc.add_argument("new", help="改后逻辑的 SQL 文件")
-    sc.add_argument("--key", required=True, help="唯一键列，逗号分隔（如 request_id,file_id,node_oper）")
-    sc.add_argument("--measure", help="要逐值对比的度量列，逗号分隔（可选，不给则只比键集合）")
-    sc.add_argument("--var", action="append", help="代入变量，写成 k=v，可重复")
-    sc.add_argument("--save", help="把生成的 SQL 落盘到该路径")
-    sc.set_defaults(func=cmd_compare)
-
-    return p
+    parser = argparse.ArgumentParser(description='生成保守的只读验证 SQL；不连接云服务')
+    sub = parser.add_subparsers(dest='cmd', required=True)
+    inline = sub.add_parser('inline', help='可靠的单次写入 CTAS 链路 → WITH')
+    inline.add_argument('file')
+    inline.add_argument('--target', help='只验证到已写入的中间表')
+    inline.add_argument('--project', help='非限定表名所属项目；默认已有 ODPS_PROJECT，未知不猜测')
+    inline.add_argument('--list-vars', action='store_true')
+    inline.set_defaults(func=cmd_inline)
+    compare = sub.add_parser('compare', help='先校验非空唯一键，再对比结果')
+    compare.add_argument('old')
+    compare.add_argument('new')
+    compare.add_argument('--key', required=True)
+    compare.add_argument('--measure')
+    compare.set_defaults(func=cmd_compare)
+    for command in (inline, compare):
+        command.add_argument('--var', action='append', help='name=value，可重复')
+        command.add_argument('--save', help='UTF-8 SQL 输出文件')
+    return parser
 
 
 def main():
     args = build_parser().parse_args()
     try:
         args.func(args)
-    except (ValueError, FileNotFoundError) as e:
-        print(f"[错误] {e}", file=sys.stderr)
+    except (ValueError, OSError) as error:
+        print('[无法生成验证 SQL] ' + str(error), file=sys.stderr)
         sys.exit(3)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
