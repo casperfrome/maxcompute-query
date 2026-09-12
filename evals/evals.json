@@ -13,7 +13,7 @@
           "type": "manual"
         },
         {
-          "text": "SQL 成功执行并返回了非空结果",
+          "text": "SQL 成功执行并返回了有效结果；零条在条件正确时也有效",
           "type": "manual"
         },
         {
@@ -24,7 +24,8 @@
           "text": "给出了按 join_region_name 的取值分布",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "live"
     },
     {
       "id": 1,
@@ -49,7 +50,8 @@
           "text": "SQL 成功执行并给出了明确的条数结论",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "live"
     },
     {
       "id": 2,
@@ -74,15 +76,17 @@
           "text": "SQL 成功执行并返回了排序后的结果",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "live"
     },
     {
       "id": 3,
       "name": "review-existing-sql-task",
-      "prompt": "帮我排查一下 dwd_com_sys_oa_doc_detail_log_df/dwd_com_sys_oa_doc_detail_log_df.txt 这个 sql 任务有没有明显的逻辑漏洞。",
-      "expected_output": "应触发本 skill；通读 SQL 列出可疑点（如临时表建表/依赖顺序倒置、窗口 PARTITION BY 粒度、JOIN 缺键膨胀、某流程字段恒为 NULL 等），区分'读代码即可定论的 bug'与'需数据佐证的疑点'，并对后者用 mc_query.py 主动取数验证（带分区过滤），最后给出代码层+数据层合并结论。",
+      "prompt": "仅用附件合成任务和模拟查询器/本地数据做离线评估，不连接线上。帮我审查 evals/fixtures/review_task.sql 的逻辑漏洞，区分代码可证明问题和需数据验证疑点。",
+      "expected_output": "应触发本 skill；通读 SQL 列出可疑点（如临时表建表/依赖顺序倒置、窗口 PARTITION BY 粒度、JOIN 缺键膨胀、某流程字段恒为 NULL 等），区分'读代码即可定论的 bug'与'需数据佐证的疑点'，并对后者通过 mc_query.py 的模拟入口验证合成数据（带分区过滤），最后给出代码层+数据层合并结论。 输入为显式合成样例，原历史附件不在仓库；只报告本地模拟，不宣称线上验证。",
       "files": [
-        "dwd_com_sys_oa_doc_detail_log_df/dwd_com_sys_oa_doc_detail_log_df.txt"
+        "evals/fixtures/review_task.sql",
+        "evals/fixtures/operation_rows.json"
       ],
       "assertions": [
         {
@@ -94,20 +98,22 @@
           "type": "manual"
         },
         {
-          "text": "对可数据验证的疑点用 mc_query.py 实际取数佐证，且 SQL 带分区过滤",
+          "text": "对可数据验证的疑点通过模拟 mc_query.py 入口取数佐证，且 SQL 带分区过滤",
           "type": "manual"
         },
         {
           "text": "区分了'读代码即可定论的 bug'与'需数据佐证的疑点'，给出合并结论",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline",
+      "fixture_note": "原历史附件缺失，现提供明确合成替代，保留任务场景；不得冒充原业务任务或真实线上数据。"
     },
     {
       "id": 4,
       "name": "explain-wrong-result-of-sql",
       "prompt": "这段 odps sql 算出来的门店活动营业额比美团后台对账高了好几倍，帮我看看是不是 SQL 写错了：\nSELECT a.shop_id, a.shop_name, SUM(a.amt_total_act) amt_total\nFROM dwd_mkt_mt_wm_shop_sales_info_df a\nLEFT JOIN dwd_flw_elm_wm_shop_sales_chnl_info_df b ON a.shop_id = b.shop_id\nWHERE a.ds = MAX_PT('dwd_mkt_mt_wm_shop_sales_info_df') AND b.ds = MAX_PT('dwd_flw_elm_wm_shop_sales_chnl_info_df')\nGROUP BY a.shop_id, a.shop_name",
-      "expected_output": "应触发本 skill；识别根因——饿了么活动表 b 对 shop_id 一对多（一店多活动，最新分区约 9484 店 / 44311 行），LEFT JOIN 后把美团表 a 每店的 amt_total_act 按匹配到的活动行数重复累加，导致 SUM 膨胀（对账目标度量是 SUM，对行数敏感，会被膨胀影响——这点与 COUNT(DISTINCT) 不同）。用 mc_query.py 取数验证：b 是否一对多、JOIN 前后行数与 SUM 对比。线上事实（ds=最新分区）：a 本身 114 店各 1 行、SUM(amt_total_act)=521357；匹配到 b 的 106 店真实合计=515789，但 JOIN 后膨胀到 538 行、合计≈2617730（约 5 倍）。修复：先把 b 按 shop_id 预聚合/去重到一行再 JOIN，或仅需美团金额时不 JOIN。",
+      "expected_output": "识别 JOIN 基数导致 SUM 膨胀的可能性，以及 WHERE 右表条件对 LEFT JOIN 未匹配行的影响。用 mc_query.py 按当前分区核实 b 的每店行数、a 粒度、匹配覆盖、JOIN 前后行数和 SUM；若数据不支持膨胀则据实证伪。结论引用实际查询及实例证据，不能套用历史倍率。按用户需要的度量设计 b 预聚合/去重或去掉无用 JOIN，明确过滤与未匹配行语义；没有数据证据时不把静态猜测写成已确认根因。原历史数字单独保存在 evals/fixtures/historical_join_observation.json，仅为归档样例。",
       "files": [],
       "assertions": [
         {
@@ -115,26 +121,28 @@
           "type": "manual"
         },
         {
-          "text": "识别根因是 b 表对 shop_id 一对多、LEFT JOIN 使 SUM 行膨胀（未把它误判成 COUNT(DISTINCT) 类问题）",
+          "text": "区分 SUM 对重复行敏感和 COUNT(DISTINCT) 的不同语义，核实基数与过滤后再确定根因，不先验要求一定膨胀",
           "type": "manual"
         },
         {
-          "text": "用 mc_query.py 取数佐证一对多与膨胀（b 每店行数>1 / JOIN 前后 SUM 或行数对比），且 SQL 带分区过滤（MAX_PT 或 ds=）",
+          "text": "用 mc_query.py 查询当前分区的键基数、匹配覆盖、JOIN 前后行数/SUM，保留真实 SQL、分区和实例证据；零差异也可为有效结论",
           "type": "manual"
         },
         {
-          "text": "给出明确结论（膨胀约 5 倍）与正确修复（b 先按 shop_id 去重/预聚合再 JOIN，或不 JOIN）",
+          "text": "结论倍率由实际同范围查询结果计算，修复遵守实际业务度量和未匹配行语义，不使用固定历史倍率",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "live"
     },
     {
       "id": 5,
       "name": "modify-existing-sql-task-grain",
-      "prompt": "未读附件就审批检测/dwd_com_sys_oa_doc_detail_log_df.txt 这个 SQL 任务，我想改为：每个 request_id、file_id、node_oper 作为唯一键，如果一个文件有多次操作记录，就取最早的那次就好。",
-      "expected_output": "应触发本 skill：把『改 SQL』当成一次取数排查。改前用 mc_query.py 核实膨胀前提（当前是否真的会出现 (request_id,file_id,node_oper) 多行、规模多大）以及方案依赖的假设（operate_time 字符串格式是否统一可比较），再设计去重改法；给出改法后再用数据自检新唯一键是否真唯一、行数增减是否合理。所有取数 SQL 带分区过滤。",
+      "prompt": "仅用附件合成任务和模拟查询器/本地数据做离线评估，不连接线上。把 evals/fixtures/dedup_task.sql 改为 request_id、file_id、node_oper 唯一键，取最早操作；先查看合成行，NULL 或并列处理未给定义时列出需决定项，明确前提后修改并核验。",
+      "expected_output": "应触发本 skill：把『改 SQL』当成一次取数排查。改前通过 mc_query.py 的模拟入口核实膨胀前提（当前是否真的会出现 (request_id,file_id,node_oper) 多行、规模多大）以及方案依赖的假设（operate_time 字符串格式是否统一可比较），再设计去重改法；给出改法后再用数据自检新唯一键是否真唯一、行数增减是否合理。所有取数 SQL 带分区过滤。 输入为显式合成样例，原历史附件不在仓库；只报告本地模拟，不宣称线上验证。 合成数据含 NULL 时间；若排序和并列规则尚未明确，先给出候选与影响，不能自行丢弃这些行。",
       "files": [
-        "未读附件就审批检测/dwd_com_sys_oa_doc_detail_log_df.txt"
+        "evals/fixtures/dedup_task.sql",
+        "evals/fixtures/operation_rows.json"
       ],
       "assertions": [
         {
@@ -142,7 +150,7 @@
           "type": "manual"
         },
         {
-          "text": "改前用 mc_query.py 取数核实膨胀前提（同键是否真有多行 / operate_time 格式是否可比较）",
+          "text": "改前通过模拟 mc_query.py 入口取数核实膨胀前提（同键是否真有多行 / operate_time 格式是否可比较）",
           "type": "manual"
         },
         {
@@ -153,13 +161,15 @@
           "text": "给出改法后用数据自检新唯一键唯一性或行数增减",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline",
+      "fixture_note": "原历史附件缺失，现提供明确合成替代，保留任务场景；不得冒充原业务任务或真实线上数据。"
     },
     {
       "id": 6,
       "name": "ask-ambiguous-caliber-region",
       "prompt": "帮我按地区统计下 dwd_fran_dev_h3_base_info_df 的 h3 数量分布。",
-      "expected_output": "『地区』口径不明确（表里同时有 province_name 省、city_name 市、join_region_name 区域性质等多个可解读为『地区』的字段，按省/按市/按区域性质结果完全不同），数据本身判不了这取决于用户想要哪个口径。期望：先 desc 探查发现存在多个可选字段，然后用提问框（AskUserQuestion）带具体选项（按省 / 按市 / 按区域性质，附各字段含义或非空情况）让用户选，而不是擅自挑一个字段直接出数。属于『取决于用户口径、该问』那一档。",
+      "expected_output": "『地区』口径不明确（表里同时有 province_name 省、city_name 市、join_region_name 区域性质等多个可解读为『地区』的字段，按省/按市/按区域性质结果完全不同），数据本身判不了这取决于用户想要哪个口径。期望：先 desc 探查发现存在多个可选字段，然后用宿主可用的提问方式带具体选项（按省 / 按市 / 按区域性质，附各字段含义或非空情况）让用户选，而不是擅自挑一个字段直接出数。属于『取决于用户口径、该问』那一档。",
       "files": [],
       "assertions": [
         {
@@ -167,7 +177,7 @@
           "type": "manual"
         },
         {
-          "text": "停下来向用户澄清该用哪个口径（提问框或明确的带选项澄清请求），且给出了具体可选项",
+          "text": "停下来向用户澄清该用哪个口径（宿主可用的提问方式或明确的带选项澄清请求），且给出了具体可选项",
           "type": "manual"
         },
         {
@@ -178,15 +188,17 @@
           "text": "澄清时尽量带上已探查到的证据（字段含义/分布/非空情况）作为选项依据，而非裸问",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "live"
     },
     {
       "id": 7,
       "name": "ask-ambiguous-dedup-choice",
-      "prompt": "帮我把 dwd_com_sys_oa_doc_detail_log_df 这个任务改一下，同一个文件如果有多条操作记录，只保留一条就行。",
-      "expected_output": "改造意图本身有歧义：『只保留一条』没说保留最早还是最新、按哪个时间字段判断先后、并列（同一时间多条）怎么处理——这些数据判不了，取决于用户。期望：先用 fetch_task_sql.py 拉代码 + 取数核实前提（同文件是否真有多条、候选时间字段格式是否可比较），但在动手重写前，用提问框带选项问清『保留最早/最新』『按哪个时间字段』『并列如何处理』，拿到答复再改。不应在未确认取舍的情况下闭眼重写出一版 SQL。属于『改造取舍取决于用户、该问』那一档。",
+      "prompt": "仅用附件合成任务和模拟查询器/本地数据做离线评估，不连接线上。evals/fixtures/dedup_task.sql 里同一个文件有多条操作，只保留一条就行。请先核实记录和候选字段，再按可用提问方式澄清影响结果的取舍。",
+      "expected_output": "改造意图本身有歧义：『只保留一条』没说保留最早还是最新、按哪个时间字段判断先后、并列（同一时间多条）怎么处理——这些数据判不了，取决于用户。期望：先读取附件合成任务 + 通过模拟查询器核实前提（同文件是否真有多条、候选时间字段格式是否可比较），但在动手重写前，用宿主可用的提问方式带选项问清『保留最早/最新』『按哪个时间字段』『并列如何处理』，拿到答复再改。不应在未确认取舍的情况下闭眼重写出一版 SQL。属于『改造取舍取决于用户、该问』那一档。 输入为显式合成样例，原历史附件不在仓库；只报告本地模拟，不宣称线上验证。",
       "files": [
-        "未读附件就审批检测/dwd_com_sys_oa_doc_detail_log_df.txt"
+        "evals/fixtures/dedup_task.sql",
+        "evals/fixtures/operation_rows.json"
       ],
       "assertions": [
         {
@@ -198,20 +210,22 @@
           "type": "manual"
         },
         {
-          "text": "在重写 SQL 前停下来用提问框（或明确的带选项澄清）问清取舍，给出了具体可选项",
+          "text": "在重写 SQL 前停下来用宿主可用的提问方式（或明确的带选项澄清）问清取舍，给出了具体可选项",
           "type": "manual"
         },
         {
           "text": "没有在未确认取舍的情况下直接给出一版『最终改好』的 SQL",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline",
+      "fixture_note": "原历史附件缺失，现提供明确合成替代，保留任务场景；不得冒充原业务任务或真实线上数据。"
     },
     {
       "id": 8,
       "name": "ask-or-resolve-table-candidate",
       "prompt": "帮我查下 oa 那个归档相关的表，最新分区有多少行？",
-      "expected_output": "表名只给了模糊关键字（oa+归档）。期望先用 fetch_task_sql.py --search 或 mc_query.py list-tables 把候选列出来，再按结果正确分支：若命中多张都合理的候选表，用提问框带候选名+各自规模让用户选哪张再查；若只命中唯一一张，直接对它查行数即可（这种情况不必发问）。考察的是『先查清候选、再决定该不该问』的证据优先行为，而不是凭名字猜一张表硬查、也不是命中唯一时还多此一举发问。",
+      "expected_output": "表名只给了模糊关键字（oa+归档）。期望先用 fetch_task_sql.py --search 或 mc_query.py list-tables 把候选列出来，再按结果正确分支：若命中多张都合理的候选表，用宿主可用的提问方式带候选名+各自规模让用户选哪张再查；若只命中唯一一张，直接对它查行数即可（这种情况不必发问）。考察的是『先查清候选、再决定该不该问』的证据优先行为，而不是凭名字猜一张表硬查、也不是命中唯一时还多此一举发问。",
       "files": [],
       "assertions": [
         {
@@ -219,14 +233,15 @@
           "type": "manual"
         },
         {
-          "text": "命中多张候选时用提问框（带候选+规模）让用户选；命中唯一时直接查、不多此一举发问——分支正确",
+          "text": "命中多张候选时用宿主可用的提问方式（带候选+规模）让用户选；命中唯一时直接查、不多此一举发问——分支正确",
           "type": "manual"
         },
         {
           "text": "最终真正执行的行数查询带分区过滤（MAX_PT 或 ds=）",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "live"
     },
     {
       "id": 9,
@@ -248,10 +263,11 @@
           "type": "manual"
         },
         {
-          "text": "没有不必要地弹出提问框（这是该自己查清、不该问的情形）",
+          "text": "没有不必要地弹出宿主可用的提问方式（这是该自己查清、不该问的情形）",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "live"
     },
     {
       "id": 10,
@@ -276,7 +292,8 @@
           "text": "建议兼容修改时保留 NULL 分组语义，不只删除启动检查",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline"
     },
     {
       "id": 11,
@@ -301,7 +318,8 @@
           "text": "未改代码或调用运行接口",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline"
     },
     {
       "id": 12,
@@ -326,12 +344,13 @@
           "text": "只在解析副本还原 HTML/转义，未运行任务",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline"
     },
     {
       "id": 13,
       "name": "pyodps3-strict-saved-selection",
-      "prompt": "用模拟 DataWorks 响应检查取码行为，不连接线上：我要检查 test_job 文件 ID 505649513 的保存态。ListFiles 返回两个同名文件 505649513 和 505649514；GetFile(505649513) 返回 FileType=1221、FileContent=\"print('saved')\\n\"、LastEditTime=1789196400000、IsCommit=false；生产版本内容是 print('prod')。请用 skill 设计并执行本地取码检查，再说明如果 GetFile 没有 FileContent 会怎么处理。",
+      "prompt": "用模拟 DataWorks 响应检查取码行为，不连接线上：我要检查 test_job 文件 ID 505649513 的保存态。ListFiles 返回两个同名文件 505649513 和 505649514；GetFile(505649513) 的 Data.File 返回 FileId=505649513、FileName=test_job、FileType=1221、Content=\"print('saved')\\n\"、LastEditTime=1789196400000、CommitStatus=0；生产版本内容是 print('prod')。请用 skill 设计并执行本地取码检查，再说明如果 GetFile 的 Data.File 缺少 Content 会怎么处理。",
       "expected_output": "按明确文件 ID 取 saved 原文，识别 PyODPS3，留存元数据及 UTF-8 SHA256。保存内容缺失不回退生产。若用户未提供 ID 且有多个同名合理候选，先消歧。仅模拟测试不线上运行。",
       "files": [],
       "assertions": [
@@ -351,7 +370,8 @@
           "text": "没有执行线上任务或本地执行取回的 Python",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline"
     },
     {
       "id": 14,
@@ -376,7 +396,8 @@
           "text": "不自动修复节点、不新建替代任务",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline"
     },
     {
       "id": 15,
@@ -401,7 +422,8 @@
           "text": "明确尚未进行字段及键对照，不编造零差异",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline"
     },
     {
       "id": 16,
@@ -426,7 +448,8 @@
           "text": "报告离线校验结果而非线上成功",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline"
     },
     {
       "id": 17,
@@ -451,7 +474,8 @@
           "text": "未调用线上 API，未宣称真实验证完成",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline"
     },
     {
       "id": 18,
@@ -472,12 +496,13 @@
           "text": "模拟刷新权限失败后仍能读取已缓存日志，明确标注缓存和获取错误",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline"
     },
     {
       "id": 19,
       "name": "pyodps3-editor-history-browser-unavailable",
-      "prompt": "读取我今天在 DataWorks 编辑器点击运行的 test_job 的控制台输出。浏览器工具报 nodeRepl.fetch request failed，目前没有导出的日志。不要提交或重跑节点。",
+      "prompt": "模拟浏览器不可用场景，不实际调用线上服务：读取我今天在 DataWorks 编辑器点击运行的 test_job 的控制台输出。浏览器工具报 nodeRepl.fetch request failed，目前没有导出的日志。不要提交或重跑节点。",
       "expected_output": "识别为页面运行历史，浏览器失败时报告实际连接缺口，不把页面运行 ID 当作运维实例 ID，也不假称读到输出。说明恢复已登录浏览器后从运行历史核对节点和时间，或导入现有 UTF-8 日志；局部采集用 --partial，解析不连接 DataWorks。",
       "files": [],
       "assertions": [
@@ -493,7 +518,8 @@
           "text": "给出文件或标准输入解析入口，并标记部分采集的证据限制",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline"
     },
     {
       "id": 20,
@@ -518,7 +544,8 @@
           "text": "授权覆盖时不重复问许可，运行验证与业务验证分别报告",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline"
     },
     {
       "id": 21,
@@ -543,7 +570,8 @@
           "text": "不把不确定提交当 Python 错误自动修改并提交",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline"
     },
     {
       "id": 22,
@@ -568,7 +596,8 @@
           "text": "无需重跑来制造日志",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline"
     },
     {
       "id": 23,
@@ -593,7 +622,8 @@
           "text": "日志完整性未知/截断与请求成功分别报告",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline"
     },
     {
       "id": 24,
@@ -626,7 +656,8 @@
           "text": "结合手动触发、进程、起止时间和退出码核对非空跑，不因 TriggerRecurrence=Manual 判定未执行",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline"
     },
     {
       "id": 25,
@@ -651,7 +682,13 @@
           "text": "不凭 test 命名/Dev 环境推断无生产副作用",
           "type": "manual"
         }
-      ]
+      ],
+      "mode": "offline"
     }
-  ]
+  ],
+  "evaluation_protocol": {
+    "live": "需当前已授权的只读环境；先查元数据/分区，结论必须匹配实际 SQL 与实例证据。零结果有效，不绑定固定最新数字；缺权限或凭证记未完成，不能造数。",
+    "offline": "纯文本、合成附件、模拟 API 或 SQLite 等本地计算；禁止提交云任务或本地执行取回 Python。模拟通过不能标为线上验证。",
+    "assertions": "26 个场景人工判断与 pytest 自动回归分别记录；附件路径相对技能根目录。"
+  }
 }

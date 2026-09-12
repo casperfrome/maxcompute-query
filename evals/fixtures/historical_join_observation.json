@@ -1,0 +1,13 @@
+{
+  "fixture_kind": "archived_review_numbers",
+  "not_live": true,
+  "provenance": "Numbers retained verbatim from original eval 4 expected_output; not revalidated in this optimization. Never assert against latest partition.",
+  "right_distinct_shops": 9484,
+  "right_rows": 44311,
+  "left_shops": 114,
+  "left_amount_sum": 521357,
+  "matched_shops": 106,
+  "matched_left_amount_sum": 515789,
+  "joined_rows": 538,
+  "joined_amount_sum_approx": 2617730
+}

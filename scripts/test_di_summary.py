@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""test_di_summary.py — di_task 的确定性回归用例（不连库/网，秒级跑完）。
+r"""test_di_summary.py — di_task 的确定性回归用例（不连库/网，秒级跑完）。
 
 只导入 di_task 的纯函数，对内置的 DataX 配置样本断言：
   - detect_di_config 能区分「DI 同步配置」与「SQL / 普通 JSON」；
@@ -8,7 +8,7 @@
   - audit_column_mapping 的判级正确：列数不一致→error、有改名→info、完全同名→ok；
   - 渲染不抛错。
 跑法：
-    python test_di_summary.py
+    & 'D:\PythonVenv\Scripts\python.exe' -X utf8 -B 'D:\AllForCareer\数仓问题排查\.agents\skills\maxcompute-query\scripts\test_di_summary.py'
 全绿退出码 0；任一用例不符合预期则打印明细并以退出码 1 退出。
 
 为什么用它验证：DI 解析是本次新增的核心逻辑，确定性单测信噪比最高——尤其是「列数不一致
@@ -17,6 +17,7 @@
 import json
 import os
 import sys
+import pytest
 
 try:  # Windows GBK 控制台下也能正常打印中文
     sys.stdout.reconfigure(encoding="utf-8")
@@ -141,6 +142,48 @@ def main() -> int:
         return 1
     print("PASS: di_task 全部用例符合预期。")
     return 0
+
+
+def test_existing_summary_contracts():
+    assert main() == 0
+
+
+@pytest.mark.parametrize('columns', [None, [], [''], ['*'], [None], [{}], [{'value': 'constant'}]])
+def test_missing_or_invalid_columns_are_unknown(columns):
+    data = detect_di_config(_datax(columns, columns))
+    info = parse_di_config(data)
+    assert audit_column_mapping(info['source']['columns'], info['target']['columns'])[0] == 'unknown'
+    output = render_di_summary(data)
+    assert '不足以判断' in output and '✓' not in output
+
+
+@pytest.mark.parametrize('category', ['reader', 'writer'])
+def test_multiple_steps_do_not_claim_complete_mapping(category):
+    data = detect_di_config(_datax(['id'], ['id']))
+    data['steps'].append({'category': category, 'stepType': 'other', 'parameter': {'table': 'second_table', 'column': ['other']}})
+    output = render_di_summary(data)
+    assert '暂不支持完整映射' in output
+    assert 'second_table' in output and '✓' not in output
+
+
+@pytest.mark.parametrize('parameter', [None, [], 'invalid'])
+def test_invalid_parameter_block_is_insufficient_information(parameter):
+    data = detect_di_config(_datax(['id'], ['id']))
+    data['steps'][0]['parameter'] = parameter
+    assert '不足以判断' in render_di_summary(data)
+
+
+def test_audit_missing_column_lists_is_unknown():
+    assert audit_column_mapping(None, None)[0] == 'unknown'
+
+
+@pytest.mark.parametrize('columns', [['${columns}'], [{'name': '${columns}'}]])
+def test_unresolved_column_parameters_are_not_valid_mapping(columns):
+    data = detect_di_config(_datax(columns, columns))
+    info = parse_di_config(data)
+    assert audit_column_mapping(info['source']['columns'], info['target']['columns'])[0] == 'unknown'
+    output = render_di_summary(data)
+    assert '不足以判断' in output and '✓' not in output
 
 
 if __name__ == "__main__":

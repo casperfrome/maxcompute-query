@@ -15,7 +15,7 @@ JSON 很难读，且 reader/writer 的 column 是**按位置一一对应**的，
 运行设置刻意不收录，避免摘要被次要信息淹没。
 
 列映射审查的口径（避免狼来了）：
-  - **列数不一致** → `⚠` 重点告警：按位置映射必然整体错位，几乎一定是 bug。
+  - **列数不一致** → `⚠` 无法建立完整一一对应，逐列核对缺口。
   - **列数一致但有列名不同** → 仅 `≠` 标注 + 一行 `ℹ` 说明：离线同步按位置映射、源目标改名
     很常见且多半是有意为之，这里只提示人工确认，不当成错误。
   - **完全同名一一对应** → `✓`。
@@ -24,6 +24,7 @@ JSON 很难读，且 reader/writer 的 column 是**按位置一一对应**的，
 """
 
 import json
+import re
 
 
 # ---------------------------------------------------------------------------
@@ -69,10 +70,11 @@ def detect_di_config(content):
 def _col_name(c):
     """列条目取名：DataX 多数是字符串，少数 reader/writer 用 {"name":..,"type":..} 对象。"""
     if isinstance(c, str):
-        return c
+        return c.strip() or None
     if isinstance(c, dict):
-        return c.get("name") or c.get("column") or json.dumps(c, ensure_ascii=False)
-    return str(c)
+        value = c.get("name") or c.get("column")
+        return value.strip() if isinstance(value, str) and value.strip() else None
+    return None
 
 
 def _find_step(steps, category):
@@ -90,13 +92,26 @@ def _as_list(v):
     return [v]
 
 
+def _parameters(step):
+    value = step.get('parameter')
+    return value if isinstance(value, dict) else {}
+
+
 def parse_di_config(data):
-    """从解析后的 DataX 配置抽出 {source, target, runtime} 三块结构。"""
+    """抽取单 reader/writer 的源目标；多节点显式返回 unsupported。"""
     steps = data.get("steps") or []
+    steps = steps if isinstance(steps, list) else []
+    readers = [s for s in steps if isinstance(s, dict) and s.get('category') == 'reader']
+    writers = [s for s in steps if isinstance(s, dict) and s.get('category') == 'writer']
+    if len(readers) > 1 or len(writers) > 1:
+        return {'source': None, 'target': None, 'mapping_status': 'unsupported',
+                'reader_count': len(readers), 'writer_count': len(writers),
+                'candidates': [{'category': s.get('category'), 'step_type': s.get('stepType'),
+                    'table': _parameters(s).get('table')} for s in readers + writers]}
     reader = _find_step(steps, "reader") or {}
     writer = _find_step(steps, "writer") or {}
-    rp = reader.get("parameter") or {}
-    wp = writer.get("parameter") or {}
+    rp = _parameters(reader)
+    wp = _parameters(writer)
 
     source = {
         "step_type": reader.get("stepType"),
@@ -122,12 +137,16 @@ def parse_di_config(data):
 def audit_column_mapping(src_cols, dst_cols):
     """按位置对齐 reader/writer 列，返回 (level, rows, diff_count)。
 
-    level: 'error'=列数不一致（必然错位）/ 'info'=列数一致但有改名 / 'ok'=完全同名对应。
+    level: unknown=缺有效列信息 / error=列数不一致 / info=有改名 / ok=同名对应。
     rows : [(idx, src_or_None, dst_or_None, same_bool), ...]
     """
-    n = max(len(src_cols), len(dst_cols))
     rows = []
     diff_count = 0
+    if not src_cols or not dst_cols or any(not isinstance(c, str) or not c.strip() or c.strip() == '*'
+                                          or re.search(r'\$\{|#\{|\$[A-Za-z_]\w*', c)
+                                          for c in list(src_cols) + list(dst_cols)):
+        return 'unknown', [], 0
+    n = max(len(src_cols), len(dst_cols))
     for i in range(n):
         s = src_cols[i] if i < len(src_cols) else None
         d = dst_cols[i] if i < len(dst_cols) else None
@@ -156,6 +175,13 @@ def _fmt(v, dash="-"):
 def render_di_summary(data):
     """把 DI 配置渲染成可读摘要文本（源→目标 / 列映射对照 / 写入设置）。"""
     info = parse_di_config(data)
+    if info.get('mapping_status') == 'unsupported':
+        lines = ['数据集成·离线同步摘要',
+                 '暂不支持完整映射：reader=%s，writer=%s；需要按完整拓扑逐组核对。' %
+                 (info['reader_count'], info['writer_count'])]
+        lines.extend('  %s %s table=%s' % (s['category'], _fmt(s['step_type']), _fmt(s['table']))
+                     for s in info['candidates'])
+        return '\n'.join(lines)
     src, dst = info["source"], info["target"]
     lines = []
     rline = f"reader={_fmt(src['step_type'])} → writer={_fmt(dst['step_type'])}"
@@ -167,7 +193,7 @@ def render_di_summary(data):
     lines.append("源 (Reader)")
     lines.append(f"  数据源   : {_fmt(src['datasource'])}  ({_fmt(src['step_type'])})")
     lines.append(f"  表       : {_fmt(src['table'])}")
-    lines.append(f"  分区     : {', '.join(src['partition']) if src['partition'] else '-（非分区/未指定）'}")
+    lines.append(f"  分区     : {', '.join(src['partition']) if src['partition'] else '-（未提供分区信息）'}")
     if src["where"]:
         lines.append(f"  过滤     : {src['where']}")
     lines.append(f"  列数     : {len(src['columns'])}")
@@ -188,10 +214,12 @@ def render_di_summary(data):
     level, rows, diff_count = audit_column_mapping(src["columns"], dst["columns"])
     lines.append("")
     lines.append("列映射审查（按位置 reader[i] ↔ writer[i]）")
-    if level == "error":
+    if level == 'unknown':
+        lines.append('  不足以判断：reader/writer 缺少有效的显式列信息；需补齐列顺序后核对。')
+    elif level == "error":
         lines.append(
             f"  ⚠ 列数不一致：源 {len(src['columns'])} ≠ 目标 {len(dst['columns'])}"
-            f" —— 按位置映射会整体错位，务必逐列核对！"
+            f" —— 不能建立完整一一对应，务必逐列核对！"
         )
     elif level == "info":
         lines.append(
@@ -214,23 +242,21 @@ def render_di_summary(data):
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# 便于命令行快速看：python di_task.py <配置.json>
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    import sys
-
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-    if len(sys.argv) != 2:
-        print("用法：python di_task.py <DataX配置.json>", file=sys.stderr)
-        sys.exit(2)
-    with open(sys.argv[1], "r", encoding="utf-8") as fh:
-        content = fh.read()
-    data = detect_di_config(content)
+def main(argv=None):
+    import argparse
+    from pathlib import Path
+    parser = argparse.ArgumentParser(description='离线读取 DataX 配置并检查列映射；不连接或执行任务。')
+    parser.add_argument('file', help='UTF-8 DataX 配置文件')
+    args = parser.parse_args(argv)
+    data = detect_di_config(Path(args.file).read_text(encoding='utf-8-sig'))
     if data is None:
-        print("不是数据集成(离线同步)配置——可能是 SQL 或其他类型任务。", file=sys.stderr)
-        sys.exit(1)
+        parser.error('不是数据集成离线同步配置。')
     print(render_di_summary(data))
+    return 0
+
+
+if __name__ == '__main__':
+    import sys
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
+    sys.exit(main())

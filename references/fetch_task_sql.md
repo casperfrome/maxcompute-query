@@ -1,61 +1,57 @@
-# fetch_task_sql.py：保存态 / 历史版本 / 数据集成同步任务
+# DataWorks 基础取码、消歧、保存态、版本与 DI
 
-`fetch_task_sql.py` 的基础用法（按产出表名拉线上 SQL）在 SKILL.md 正文里。本文件说明严格保存态取码、历史版本和数据集成离线同步任务；按当前场景阅读对应部分。
+B/C 只有任务或表名时先读本文件；已提供完整代码不重复替换。取码本身不执行任务，SQL/DI 是审查对象，验证另写只读 SQL。取回 Python 不本地导入或执行；授权调试走 [PyODPS3 专用入口](pyodps3_debugging.md)。返回 [技能场景路由](../SKILL.md#场景路由)。
 
-> 取码命令本身不执行任务。取回的 SQL 和 DI 配置只供阅读分析，不能直接传给 `mc_query.py`；验证时另写只读查询。用户授权运行 PyODPS3 保存态时，使用 [PyODPS3 调试入口](pyodps3_debugging.md)，不在本地 `exec`、导入或执行取回的 Python。
-
-## 严格保存态取码
-
-用户说“保存态”“已保存未提交”或要求测试当前编辑内容时，指定 `--source saved`。它通过 DataWorks 文件 ID 获取当前保存内容，保留文件 ID、类型、修改时间、提交状态和 UTF-8 原文 SHA256；`1221` 识别为 PyODPS3。保存态不是生产发布版，也不是最近提交版本。
+## 基础取码与候选身份
 
 ```powershell
-# 有文件 ID 时精确读取；按文件 ID 取码无需填写任务名
-& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/fetch_task_sql.py --source saved --file-id 505649513 --save saved.py
-
-# 只有名称时使用精确名称；多个同名候选必须按 ID 消歧
-& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/fetch_task_sql.py test_dwd_com_sys_oa_doc_detail_log_df_pyodps3 --source saved
+$fetchTool = 'D:\AllForCareer\数仓问题排查\.agents\skills\maxcompute-query\scripts\fetch_task_sql.py'
+# 名称或 MaxCompute 产出表名；auto 优先生产代码，空生产内容时采用匹配文件的开发内容
+& 'D:\PythonVenv\Scripts\python.exe' -X utf8 -B $fetchTool example_task
+# 关键字搜索必须带名称，不自动选择候选
+& 'D:\PythonVenv\Scripts\python.exe' -X utf8 -B $fetchTool example --search
+# 精确文件 ID 支持 auto；提供名称时必须与 GetFile 返回名称一致
+& 'D:\PythonVenv\Scripts\python.exe' -X utf8 -B $fetchTool example_task --file-id 42 --save outputs/task.sql
+# 仅凭生产节点 ID 直接取生产代码；不会回退到其他文件
+& 'D:\PythonVenv\Scripts\python.exe' -X utf8 -B $fetchTool --node-id 91 --save outputs/prod.sql
 ```
 
-保存态缺失、类型不符或存在多个合理候选时，报告原问题；不回退生产代码，不自行挑第一个候选。`--source saved` 不与历史版本选择混用。需要保留运行配置、检查写入目标或运行时，用 `debug_pyodps3.py inspect/run-saved` 生成完整证据包。上面的文件 ID 是本轮测试对象示例，不是其他任务的默认值。
+42、91 和任务名均是合成示例，替换为当前核实的身份。多精确同名文件或多产出节点返回歧义，报告包含可得的目录、file_id、node_id；缺少某项时不能猜值。文件代码为空也不能改选同名另一任务。先查看候选与目录消歧，若多个目标都合理且无法靠用户上下文决定，按宿主可用方式澄清。
 
-## 历史版本拉取
+`--file-id` 与 `--node-id` 互斥。`--node-id` 只用于直接获取生产态，不能同时给名称，也不能与 saved、search、list-versions/get-version/diff 混用。`--search` 必须有名称，不能带文件 ID。普通精确文件取码会核对文件身份，优先生产内容，生产内容为空才使用该文件开发内容；API 权限错误不是“内容为空”，不能静默跳过错误。
 
-当用户要看任务的**历史版本**（「上一版长什么样」「两周前那版的代码」「最近两次提交改了什么」「这次回归是哪一版引入的」）时，用同一个 `fetch_task_sql.py` 的版本子命令——它走 DataWorks 的文件版本历史：
+## 严格保存态
 
 ```powershell
-# 1) 先列出该任务所有历史版本（版本号 / 提交时间 / 提交人 / 状态 / 是否当前生产版★ / 变更类型 / 字符数 / 备注）
-& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --list-versions
-
-# 2) 按版本号取某一历史版本的完整 SQL（可配 --save 落盘）
-& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --get-version 7
-& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --get-version 7 --save v7.sql
-
-# 3) 对比两个历史版本，看具体改了哪些行（输出 unified diff）
-& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --diff 6 7
+& 'D:\PythonVenv\Scripts\python.exe' -X utf8 -B $fetchTool --source saved --file-id 42 --save outputs/saved.py
+& 'D:\PythonVenv\Scripts\python.exe' -X utf8 -B $fetchTool example_task --source saved
 ```
 
-典型用法：先 `--list-versions` 看清有哪些版本、哪版是当前生产版（标 ★），再用 `--get-version N` 取目标版代码，或 `--diff A B` 定位两版之间的改动。版本号不存在会以退出码 4 友好报错——回到 `--list-versions` 核对可用版本号。
+saved 只取 GetFile 当前保存内容，保留 UTF-8 原文和 SHA256、文件 ID、类型、修改/提交元信息与可得配置。1221 标为 PYODPS3；保存态不等于生产发布版或最近提交版。多个同名文件必须指定 ID；空保存代码或不存在时失败，绝不回退 ListFiles.content、生产或历史版本。`--source saved` 不与搜索/历史模式混用。只需审查可保存原文；需要写入目标预检和运行证据包用调试脚本 inspect。
 
-审查/修改场景里，若怀疑「问题/回归是最近一次改动引入的」，先 `--list-versions` 看改动时间线、再 `--diff <旧版> <新版>` 定位是哪一版改了哪几行；若用户的改法是「回退到之前某版/在上一版基础上改」，先 `--get-version N` 取那一版作为基线再动手。
-
-## 数据集成（离线同步）任务读法
-
-DataWorks「数据开发」里除了 ODPS SQL 任务，还有**数据集成离线同步节点**（DI 节点，目录常在 `.../folderDi`，命名多为 `to_holo_..._di`），作用是把一张表的数据同步到另一个存储（最常见是 MaxCompute → Hologres）。`fetch_task_sql.py` 用同一条命令就能拉——它会**自动识别**这类任务，解读成只含同步任务真正关心的四样的精简摘要：**源、目标、写入模式、列映射**（运行设置、原始 DataX JSON 等次要信息刻意不输出）：
+## 历史版本
 
 ```powershell
-& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/fetch_task_sql.py to_holo_ads_shop_opn_patrol_task_shop_nature_di
+# 文件 ID 可用于所有历史操作，名称可省略；同给名称时仍 cross-check
+& 'D:\PythonVenv\Scripts\python.exe' -X utf8 -B $fetchTool --file-id 42 --list-versions
+& 'D:\PythonVenv\Scripts\python.exe' -X utf8 -B $fetchTool --file-id 42 --get-version 7 --save outputs/v7.sql
+& 'D:\PythonVenv\Scripts\python.exe' -X utf8 -B $fetchTool --file-id 42 --diff 6 7
 ```
 
-摘要怎么读：
-- **源 (Reader)**：从哪张表、哪个分区（如 `ds=${bizdate}`）、哪些列读。
-- **目标 (Writer)**：写到哪个库.表、**写入模式**（holo 的 `conflictMode`：`update`=按主键更新 / `replace`=整行替换；`truncate` 是否清空重写）。
-- **列映射审查（按位置 reader[i] ↔ writer[i]）**：离线同步的列是**按位置一一对应**的，不是按名字——摘要把两边列逐行对齐，重点看告警级别：
-  - `⚠ 列数不一致` → 几乎一定是 bug：按位置映射会整体错位，要逐列核对。
-  - `ℹ 有 N 处列名不同` → 多半是有意改名（源 `issue_count` 写到目标 `issue_cnt`），但仍要人工扫一眼，确认不是从某一行起发生整体错位。
-  - `✓ 完全同名对应` → 放心。
+先看版本列表中的时间、提交人、备注及当前生产标记，再选择版本。版本号不存在时退出 4，回列表核对。名称解析和产出反查每层都要唯一；不能按第一个同名文件查历史，也不能把名称相同但 node_id 不同的文件当生产节点对应文件。对“回退某版”先保留目标版本为基线，再修改本地文件。历史 API 可在保存内容为空时读取版本元信息，不因此改为 saved 运行。
 
-要不要进一步用数据佐证：
-- **源表**在 MaxCompute，可直接用 `mc_query.py` 验证——最新分区有没有数据、行数多少、某列分布，确认同步源头正常。这部分仍是本 skill 的主场。
-- **目标表**多在 Hologres（跨引擎）：本 skill 只读 MaxCompute、不连 Holo；目标侧行数核对/源目标比对请改用 `holo-query` skill。
+常见退出码：2 参数解析错误，3 选择组合或输入无效，4 未找到/歧义，5 API 错误。API 不可用时保留操作、错误码、请求 ID 等安全诊断，不展示签名请求或凭证，不假称取码成功。
 
-查找提示：DI 任务请用**任务名**（`to_holo_..._di`）查，别用 Holo 目标表名反查——按产出表反查只认 MaxCompute 表，查不到 Holo 目标。
+## DI 同步配置
+
+DI 请按任务名查，MaxCompute 产出表反查不能定位 Hologres 目标表。auto 识别 DataX 配置后打印源、目标、写入模式、按位置列映射摘要；`--save` 对 DI 的 auto 结果保存摘要，saved 则保存原始内容。摘要不是原始配置备份。
+
+- 源：reader 类型、数据源、表、分区/过滤与列顺序。分区未提供时标缺口，不能自动判断为非分区。
+- 目标：writer 类型、库表、配置中的写入模式及 truncate；实际主键/更新语义需核对目标引擎与配置，不能仅凭字段名推断。
+- 显式列数不等：无法建立完整一一对应，逐列查缺口；不能断言所有位置都错位。
+- 列数相同但改名：按位置对照确认语义，名称不同本身不证明错误。
+- 完全同名：仅名称与位置对应，仍未证明类型、数据、主键或同步结果一致。
+- 列信息缺失、空列表、通配符、未展开参数（如 `${columns}`）或无有效名称：**不足以判断**，不能显示“0 列一致”或放行。
+- 多 reader/writer：**暂不支持完整映射**，列出节点候选；按完整拓扑补充逐组核对，不从首项推出整体通过。
+
+源在 MaxCompute 时可用查询器核实分区、行数和分布，真实零条不自动判异常。目标为 Hologres 等其他引擎时需宿主当前可用的相应只读能力；未接入或未查询则明确目标侧未验证，不把源侧成功当同步成功。

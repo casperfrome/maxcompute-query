@@ -1,0 +1,60 @@
+{
+  "synthetic": true,
+  "scope": "Offline mock query evidence only. These are not live warehouse observations.",
+  "schema": {
+    "request_id": "BIGINT",
+    "file_id": "BIGINT",
+    "node_oper": "STRING",
+    "operate_time": "STRING",
+    "create_time": "STRING",
+    "event_id": "BIGINT",
+    "ds": "STRING"
+  },
+  "rows": [
+    [
+      1,
+      11,
+      "view",
+      "2026-09-11 08:00:00",
+      "2026-09-11 07:00:00",
+      101,
+      "20260911"
+    ],
+    [
+      1,
+      11,
+      "view",
+      "2026-09-11 09:00:00",
+      "2026-09-11 07:01:00",
+      102,
+      "20260911"
+    ],
+    [
+      1,
+      12,
+      "approve",
+      "2026-09-11 10:00:00",
+      "2026-09-11 07:02:00",
+      103,
+      "20260911"
+    ],
+    [
+      2,
+      21,
+      "view",
+      null,
+      "2026-09-11 11:00:00",
+      104,
+      "20260911"
+    ],
+    [
+      2,
+      21,
+      "view",
+      "2026-09-11 11:00:00",
+      "2026-09-11 11:00:00",
+      105,
+      "20260911"
+    ]
+  ]
+}
