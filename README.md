@@ -1,6 +1,6 @@
 # maxcompute-query
 
-一个 Claude Code / Agent Skill：通过辅助脚本探查表结构、编写并执行 MaxCompute (ODPS) 只读 SQL 来排查数仓/数据问题，并用真实数据为结论佐证。
+一个 Codex / Agent Skill：通过 MaxCompute (ODPS) 只读 SQL 排查数仓数据，拉取 DataWorks 代码，并调试 PyODPS3 保存态及分析输出、报错和执行日志。
 
 ## 能力
 
@@ -8,7 +8,8 @@
 - 编写并执行只读 SQL，为结论取数佐证
 - 读取**自定义函数（UDF/UDTF）的注册信息与实现源码**（`func` / `list-functions` / `resource`）：Python UDF 从 `.py` 资源读出完整源码、嵌入式/SQL 函数读 `code`、Java UDF（jar 二进制）标注无源码可读——审查任务 SQL 时遇到未知函数不必当黑盒
 - 审查 / 重构在线数仓 SQL 任务（粒度、去重、JOIN 膨胀、分区过滤等）
-- 从 DataWorks 拉取任务的线上 SQL 及历史版本（`scripts/fetch_task_sql.py`）
+- 从 DataWorks 拉取生产、开发、严格保存态代码及历史版本（`scripts/fetch_task_sql.py`）
+- PyODPS3 调试（`scripts/debug_pyodps3.py`）：保存态检查、经用户授权运行一次、状态与日志收集、离线日志分析；不自动修改或发布节点、不自动修复重跑。详见 [调试说明](references/pyodps3_debugging.md)。
 - 读取 / 解读**数据集成（离线同步）任务**：自动给出源表 → 目标表、写入模式、reader/writer 列按位置映射对照（含错位审查）
 
 ## 目录结构
@@ -18,12 +19,14 @@ SKILL.md                    技能说明（触发条件、工作流）
 scripts/
   config.example.py         连接配置模板（密钥走环境变量；config.py 仅存非密钥配置）
   mc_query.py               执行只读 SQL / 探查表结构 / 读取 UDF 源码（func、list-functions、resource）
-  fetch_task_sql.py         从 DataWorks 拉取任务 SQL / 历史版本，并解读数据集成离线同步任务
+  fetch_task_sql.py         拉取严格保存态 / 线上代码 / 历史版本，并解读 DI 同步任务
+  debug_pyodps3.py          PyODPS3 保存态检查、运行、状态、日志和离线诊断
   di_task.py                数据集成同步配置解析（源/目标/写入模式/列映射审查）
   build_validation_sql.py   生成校验 SQL
 references/
   maxcompute_sql.md         MaxCompute SQL 参考
-  fetch_task_sql.md         拉历史版本 / 读数据集成同步任务（进阶用法）
+  fetch_task_sql.md         保存态 / 历史版本 / 数据集成同步任务
+  pyodps3_debugging.md      PyODPS3 运行与诊断流程、权限边界、官方 API
 agents/                     子代理（任务分析、校验）
 evals/                      评测用例
 ```
@@ -53,8 +56,10 @@ export ALIYUN_ACCESS_KEY_SECRET=...
 
 ## 安装为 Skill
 
-将本目录放到 Claude Code 的 skills 目录下，例如：
+本项目技能目录为：
 
 ```
-<project>/.claude/skills/maxcompute-query/
+<project>/.agents/skills/maxcompute-query/
 ```
+
+本项目调试及测试统一使用 `D:\PythonVenv\Scripts\python.exe`。SQL 查询通道保持只读；PyODPS3 运行可能执行脚本中的写入，必须先核实保存态的实际目标及用户授权。

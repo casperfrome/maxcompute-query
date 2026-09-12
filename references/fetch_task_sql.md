@@ -1,23 +1,37 @@
-# fetch_task_sql.py 进阶用法：历史版本 / 数据集成同步任务
+# fetch_task_sql.py：保存态 / 历史版本 / 数据集成同步任务
 
-`fetch_task_sql.py` 的基础用法（按产出表名拉线上 SQL）在 SKILL.md 正文里。本文件收两类**条件性**用法：拉历史版本、读数据集成离线同步任务——只在对应场景下才需要，所以从正文挪到这里。
+`fetch_task_sql.py` 的基础用法（按产出表名拉线上 SQL）在 SKILL.md 正文里。本文件说明严格保存态取码、历史版本和数据集成离线同步任务；按当前场景阅读对应部分。
 
-> **只读不执行不变量（与正文一致）。** 这里拉回来的一切（历史版本 SQL、数据集成同步配置）都含写语义或写语句，**只供阅读分析，绝不要丢给 `mc_query.py` 执行**。要验证其中的前提或结果，另写只读 `SELECT` 走 `mc_query.py`。
+> 取码命令本身不执行任务。取回的 SQL 和 DI 配置只供阅读分析，不能直接传给 `mc_query.py`；验证时另写只读查询。用户授权运行 PyODPS3 保存态时，使用 [PyODPS3 调试入口](pyodps3_debugging.md)，不在本地 `exec`、导入或执行取回的 Python。
+
+## 严格保存态取码
+
+用户说“保存态”“已保存未提交”或要求测试当前编辑内容时，指定 `--source saved`。它通过 DataWorks 文件 ID 获取当前保存内容，保留文件 ID、类型、修改时间、提交状态和 UTF-8 原文 SHA256；`1221` 识别为 PyODPS3。保存态不是生产发布版，也不是最近提交版本。
+
+```powershell
+# 有文件 ID 时精确读取；按文件 ID 取码无需填写任务名
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/fetch_task_sql.py --source saved --file-id 505649513 --save saved.py
+
+# 只有名称时使用精确名称；多个同名候选必须按 ID 消歧
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/fetch_task_sql.py test_dwd_com_sys_oa_doc_detail_log_df_pyodps3 --source saved
+```
+
+保存态缺失、类型不符或存在多个合理候选时，报告原问题；不回退生产代码，不自行挑第一个候选。`--source saved` 不与历史版本选择混用。需要保留运行配置、检查写入目标或运行时，用 `debug_pyodps3.py inspect/run-saved` 生成完整证据包。上面的文件 ID 是本轮测试对象示例，不是其他任务的默认值。
 
 ## 历史版本拉取
 
 当用户要看任务的**历史版本**（「上一版长什么样」「两周前那版的代码」「最近两次提交改了什么」「这次回归是哪一版引入的」）时，用同一个 `fetch_task_sql.py` 的版本子命令——它走 DataWorks 的文件版本历史：
 
-```bash
+```powershell
 # 1) 先列出该任务所有历史版本（版本号 / 提交时间 / 提交人 / 状态 / 是否当前生产版★ / 变更类型 / 字符数 / 备注）
-python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --list-versions
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --list-versions
 
 # 2) 按版本号取某一历史版本的完整 SQL（可配 --save 落盘）
-python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --get-version 7
-python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --get-version 7 --save v7.sql
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --get-version 7
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --get-version 7 --save v7.sql
 
 # 3) 对比两个历史版本，看具体改了哪些行（输出 unified diff）
-python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --diff 6 7
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --diff 6 7
 ```
 
 典型用法：先 `--list-versions` 看清有哪些版本、哪版是当前生产版（标 ★），再用 `--get-version N` 取目标版代码，或 `--diff A B` 定位两版之间的改动。版本号不存在会以退出码 4 友好报错——回到 `--list-versions` 核对可用版本号。
@@ -28,8 +42,8 @@ python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --diff 
 
 DataWorks「数据开发」里除了 ODPS SQL 任务，还有**数据集成离线同步节点**（DI 节点，目录常在 `.../folderDi`，命名多为 `to_holo_..._di`），作用是把一张表的数据同步到另一个存储（最常见是 MaxCompute → Hologres）。`fetch_task_sql.py` 用同一条命令就能拉——它会**自动识别**这类任务，解读成只含同步任务真正关心的四样的精简摘要：**源、目标、写入模式、列映射**（运行设置、原始 DataX JSON 等次要信息刻意不输出）：
 
-```bash
-python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py to_holo_ads_shop_opn_patrol_task_shop_nature_di
+```powershell
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/fetch_task_sql.py to_holo_ads_shop_opn_patrol_task_shop_nature_di
 ```
 
 摘要怎么读：

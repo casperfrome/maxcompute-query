@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-fetch_task_sql.py — 按表名/任务名从 DataWorks 拉取线上 SQL 任务代码
+fetch_task_sql.py — 从 DataWorks 拉取 SQL / PyODPS3 / DI 任务代码（不执行）
 
 用途：当用户只给了表名/任务名（如「看看 dws_xxx 这个任务有没有逻辑问题」「帮我改下 xxx
 这个任务」）而没有贴出 SQL 时，本脚本直连 DataWorks OpenAPI，定位产出该表的任务节点，
@@ -15,6 +15,8 @@ fetch_task_sql.py — 按表名/任务名从 DataWorks 拉取线上 SQL 任务�
     python fetch_task_sql.py <表名或任务名>              # 打印该任务当前 SQL（默认）
     python fetch_task_sql.py <表名> --save out.sql       # 同时落盘到 .sql 文件
     python fetch_task_sql.py <关键字> --search           # 列出所有名字匹配的候选任务（消歧用）
+    python fetch_task_sql.py <任务名> --source saved     # 严格取 GetFile 保存态，不回退
+    python fetch_task_sql.py --file-id 123 --source saved --save node.py
 
 历史版本（看「上一版/某次提交/版本对比」时用）：
     python fetch_task_sql.py <表名> --list-versions      # 列出该任务所有历史版本
@@ -33,7 +35,9 @@ fetch_task_sql.py — 按表名/任务名从 DataWorks 拉取线上 SQL 任务�
 import argparse
 import datetime
 import difflib
+import hashlib
 import os
+import re
 import sys
 
 # stdout 用 utf-8，避免 Windows GBK 控制台打印中文/SQL 注释乱码
@@ -63,6 +67,18 @@ DATAWORKS_ODPS_PROJECT_NAME = config.DATAWORKS_ODPS_PROJECT_NAME
 
 class TaskSqlNotFound(LookupError):
     """按表名/任务名在 DataWorks 中找不到对应的 SQL 任务。"""
+
+
+class SavedAPIError(RuntimeError):
+    """保存态 API 失败的安全结构；不保留 SDK 请求、异常 payload 或原错误文本。"""
+
+    def __init__(self, operation, code=None, request_id=None, permission_action=None):
+        self.operation = operation
+        self.code = code
+        self.request_id = request_id
+        self.permission_action = permission_action
+        detail = '缺少权限 ' + permission_action if permission_action else '请核实接口权限、文件和工作空间'
+        super().__init__('%s failed code=%s request_id=%s；%s。' % (operation, code, request_id, detail))
 
 
 # ---------------------------------------------------------------------------
@@ -98,10 +114,7 @@ def list_matching_files(client, task_name):
         )
         response = client.list_files(request)
         if not response.body.success:
-            raise RuntimeError(
-                "ListFiles failed: "
-                + (response.body.error_message or "unknown error")
-            )
+            raise _saved_api_error('ListFiles', response.body)
 
         data = response.body.data
         files = list(getattr(data, "files", []) or [])
@@ -181,6 +194,124 @@ def get_node_code(client, node_id):
     return response.body.data or ""
 
 
+def task_code_kind(result):
+    """优先根据真实文件类型标注代码；不能把 PyODPS3 显示成 SQL。"""
+    if str(result.get('file_type')) == '1221' or str(result.get('program_type', '')).upper() == 'PYODPS3':
+        return 'PYODPS3'
+    if di_task.detect_di_config(result.get('sql_text') or ''):
+        return 'DI'
+    program_type = str(result.get('program_type') or '')
+    if 'PYTHON' in program_type.upper() or 'PYODPS' in program_type.upper():
+        return program_type
+    if result.get('file_type') is not None and str(result['file_type']) != '10':
+        return '文件类型 ' + str(result['file_type'])
+    return program_type or 'SQL'
+
+
+def _saved_api_error(operation, error):
+    """跨新旧 SDK 提取诊断字段；不展示完整请求、签名、密钥或编码诊断详情。"""
+    if isinstance(error, SavedAPIError):
+        return error
+    data = getattr(error, 'data', None)
+    if not isinstance(data, dict):
+        data = {}
+
+    def identifier(value):
+        if value is None:
+            return None
+        text = str(value)
+        if any(secret and secret in text for secret in (ACCESS_ID, SECRET)):
+            return None
+        return text if re.fullmatch(r'[A-Za-z0-9_.-]{1,160}', text) else None
+
+    code = identifier(getattr(error, 'code', None) or getattr(error, 'error_code', None)
+                      or data.get('Code') or data.get('code') or getattr(error, 'status_code', None)
+                      or getattr(error, 'http_status_code', None) or data.get('statusCode'))
+    request_id = identifier(getattr(error, 'request_id', None) or data.get('RequestId') or data.get('requestId'))
+    permission = getattr(error, 'permission_action', None)
+    details = [getattr(error, 'access_denied_detail', None), getattr(error, 'accessDeniedDetail', None),
+               data.get('AccessDeniedDetail'), data.get('accessDeniedDetail')]
+    for item in details:
+        if isinstance(item, dict) and not permission:
+            permission = item.get('AuthAction') or item.get('authAction')
+    if not isinstance(permission, str) or not re.fullmatch(r'dataworks:[A-Za-z*]+', permission):
+        message = getattr(error, 'message', None) or getattr(error, 'error_message', None) or ''
+        match = re.search(r'\bdataworks:[A-Za-z*]+', str(message))
+        permission = match.group(0) if match else None
+    return SavedAPIError(operation, code=code, request_id=request_id, permission_action=permission)
+
+
+def _positive_file_id(value):
+    if isinstance(value, bool) or not re.fullmatch(r'[0-9]+', str(value)) or int(value) <= 0:
+        raise ValueError('file_id 必须为正整数。')
+    return int(value)
+
+
+def fetch_saved_task(name=None, file_id=None, client=None):
+    """精确获取文件保存态，绝不回退 ListFiles.content / 生产态 / 历史版本。
+
+    返回 sql_text（原文兼容字段）、code_sha256、文件元信息及采用 SDK PascalCase
+    键的 node_configuration。调用方必须独立决定是否已获授权运行该快照。
+    """
+    if name is not None:
+        name = name.strip()
+        if not name:
+            raise ValueError('任务名不能为空。')
+    if file_id is None and name is None:
+        raise ValueError('保存态取码必须提供精确任务名或 --file-id。')
+    if file_id is not None:
+        file_id = _positive_file_id(file_id)
+    client = client if client is not None else create_client()
+    match = {}
+    if file_id is None:
+        try:
+            matches = list_matching_files(client, name)
+        except Exception as exc:
+            raise _saved_api_error('ListFiles', exc) from None
+        exact = [item for item in matches if (item.get('file_name') or '').lower() == name.lower()]
+        if len(exact) > 1:
+            ids = ', '.join(str(item.get('file_id')) for item in exact)
+            raise TaskSqlNotFound('任务名 %r 存在多个保存态文件（file_id: %s）；请指定 --file-id。' % (name, ids))
+        if not exact:
+            raise TaskSqlNotFound('找不到精确任务名 %r 的保存态文件；可用 --search 查看候选。' % name)
+        match = exact[0]
+        file_id = _positive_file_id(match.get('file_id'))
+    request = dataworks_models.GetFileRequest(project_id=DATAWORKS_PROJECT_ID, file_id=file_id)
+    try:
+        response = client.get_file(request)
+    except Exception as exc:
+        raise _saved_api_error('GetFile', exc) from None
+    body = response.body
+    if not body.success:
+        raise _saved_api_error('GetFile', body)
+    data = body.data
+    saved = getattr(data, 'file', None)
+    if saved is None:
+        raise TaskSqlNotFound('file_id=%s 的保存态不存在；不会回退其他版本。' % file_id)
+    if getattr(saved, 'file_id', None) != file_id:
+        raise ValueError('GetFile 返回的 file_id 与请求不一致。')
+    saved_name = getattr(saved, 'file_name', None)
+    if not saved_name:
+        raise TaskSqlNotFound('file_id=%s 缺少保存态文件名。' % file_id)
+    if name is not None and saved_name.lower() != name.lower():
+        raise ValueError('file_id=%s 对应任务名 %r，与请求 %r 不一致。' % (file_id, saved_name, name))
+    content = getattr(saved, 'content', None)
+    if not isinstance(content, str) or not content.strip():
+        raise TaskSqlNotFound('file_id=%s 保存态代码为空；不会回退其他版本。' % file_id)
+    node_configuration = getattr(data, 'node_configuration', None)
+    result = {
+        'task_name': saved_name, 'file_name': saved_name, 'file_id': file_id,
+        'project_id': DATAWORKS_PROJECT_ID, 'source': 'saved', 'sql_text': content,
+        'code_sha256': hashlib.sha256(content.encode('utf-8')).hexdigest(),
+        'folder_path': match.get('folder_path') or '', 'dev_sql_available': True,
+        'node_configuration': node_configuration.to_map() if node_configuration is not None else {},
+    }
+    for key in ('node_id', 'file_type', 'commit_status', 'last_edit_time', 'last_edit_user',
+                'current_version', 'owner', 'connection_name', 'advanced_settings', 'deleted_status'):
+        result[key] = getattr(saved, key, None)
+    return result
+
+
 def _result_from_match(client, match):
     """把一条文件匹配转成结果 dict：优先生产态 SQL，没有再用开发态 content。"""
     task_name = (match.get("file_name") or "").strip()
@@ -196,6 +327,8 @@ def _result_from_match(client, match):
     if prod_sql:
         return {
             "task_name": task_name,
+            "file_id": match.get("file_id"),
+            "file_type": match.get("file_type"),
             "node_id": node_id,
             "folder_path": match.get("folder_path") or "",
             "source": "prod",
@@ -205,6 +338,8 @@ def _result_from_match(client, match):
     if dev_sql:
         return {
             "task_name": task_name,
+            "file_id": match.get("file_id"),
+            "file_type": match.get("file_type"),
             "node_id": node_id,
             "folder_path": match.get("folder_path") or "",
             "source": "dev",
@@ -237,6 +372,8 @@ def fetch_task_sql(task_name):
             return {
                 "task_name": name,
                 "node_id": node["node_id"],
+                "file_type": node.get("program_type"),
+                "program_type": node.get("program_type"),
                 "folder_path": "",
                 "source": "prod",
                 "sql_text": prod_sql,
@@ -412,13 +549,21 @@ def get_task_version_sql(client, file_id, version):
 # ---------------------------------------------------------------------------
 # 输出
 # ---------------------------------------------------------------------------
-def _print_header(result, kind="SQL"):
+def _print_header(result, kind=None):
+    kind = kind or task_code_kind(result)
     print("=" * 70)
     print(f"任务名     : {result['task_name']}")
     if kind == "DI":
         print("任务类型   : 数据集成·离线同步(DI, 文件态) —— 内容是同步配置而非 SQL")
-    print(f"来源       : {result['source']}  (prod=生产态 / dev=开发态)")
+    else:
+        print(f"任务类型   : {kind}")
+    print(f"来源       : {result['source']}  (prod=生产态 / dev=开发态 / saved=保存态)")
+    print(f"file_id    : {result.get('file_id')}")
     print(f"node_id    : {result.get('node_id')}")
+    if result['source'] == 'saved':
+        print(f"提交状态   : {result.get('commit_status')}  (0=保存未提交 / 1=已提交)")
+        print(f"修改时间   : {_fmt_ts(result.get('last_edit_time'))}")
+        print(f"SHA256     : {result['code_sha256']}")
     if result.get("folder_path"):
         print(f"目录       : {result['folder_path']}")
     print(f"开发态存在 : {result.get('dev_sql_available')}")
@@ -427,7 +572,14 @@ def _print_header(result, kind="SQL"):
 
 def cmd_fetch(args):
     try:
-        result = fetch_task_sql(args.name)
+        if getattr(args, 'source', 'auto') == 'saved':
+            result = fetch_saved_task(name=args.name, file_id=args.file_id)
+        elif getattr(args, 'file_id', None) is not None:
+            raise ValueError('--file-id 必须与 --source saved 一起使用。')
+        else:
+            if not args.name:
+                raise ValueError('请提供表名/任务名，或使用 --source saved --file-id。')
+            result = fetch_task_sql(args.name)
     except TaskSqlNotFound as e:
         print(f"[未找到] {e}", file=sys.stderr)
         print(
@@ -441,14 +593,14 @@ def cmd_fetch(args):
         sys.exit(4)
 
     di_data = di_task.detect_di_config(result["sql_text"])
-    _print_header(result, kind="DI" if di_data else "SQL")
+    _print_header(result)
     # DI 任务只要四样：源 / 目标 / 写入模式 / 列映射——打可读摘要即可，不再附原始 JSON 全文。
     # SQL 任务照旧打印完整代码。`--save` 也按此分别落盘（DI 存摘要、SQL 存代码）。
-    output_text = di_task.render_di_summary(di_data) if di_data else result["sql_text"]
+    output_text = di_task.render_di_summary(di_data) if di_data and result['source'] != 'saved' else result["sql_text"]
     print(output_text)
 
     if args.save:
-        with open(args.save, "w", encoding="utf-8") as f:
+        with open(args.save, "w", encoding="utf-8", newline="") as f:
             f.write(output_text)
         print(f"\n（已落盘 {len(output_text)} 字符至 {args.save}）", file=sys.stderr)
 
@@ -461,10 +613,10 @@ def cmd_search(args):
     print(f"匹配到 {len(results)} 个候选任务（关键字='{args.name}'）：")
     for r in results:
         folder = f"  [{r['folder_path']}]" if r.get("folder_path") else ""
-        kind = "DI离线同步" if di_task.detect_di_config(r["sql_text"]) else "SQL"
+        kind = task_code_kind(r)
         print(
             f"  {r['task_name']}\t({kind}, source={r['source']}, "
-            f"node_id={r.get('node_id')}, {len(r['sql_text'])} 字符){folder}"
+            f"file_id={r.get('file_id')}, node_id={r.get('node_id')}, {len(r['sql_text'])} 字符){folder}"
         )
     print(
         "\n确定目标后，用 `fetch_task_sql.py <精确任务名>` 取它的完整 SQL。",
@@ -581,10 +733,13 @@ def cmd_diff(args):
 # ---------------------------------------------------------------------------
 def build_parser():
     p = argparse.ArgumentParser(
-        description="按表名/任务名从 DataWorks 拉取线上 SQL 任务代码（只取码，不执行）",
+        description="从 DataWorks 拉取 SQL / PyODPS3 / DI 任务代码（只取码，不执行）",
     )
-    p.add_argument("name", help="表名或任务名（精确名取完整 SQL；配 --search 时当关键字用）")
-    p.add_argument("--save", help="把 SQL 落盘到该路径（建议 .sql）")
+    p.add_argument("name", nargs="?", help="表名或任务名；--source saved 时须精确任务名，可仅指定 --file-id")
+    p.add_argument("--source", choices=('auto', 'saved'), default='auto',
+                   help="auto=生产优先、开发兜底（原行为）；saved=严格获取 GetFile 保存态")
+    p.add_argument("--file-id", type=int, help="保存态文件 ID；与 --source saved 搭配，若同时提供 name 会核对名称")
+    p.add_argument("--save", help="把代码落盘（SQL 建议 .sql，PyODPS3 建议 .py）")
 
     mode = p.add_mutually_exclusive_group()
     mode.add_argument(
@@ -620,6 +775,11 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
     try:
+        specialized_mode = args.search or args.list_versions or args.get_version is not None or args.diff is not None
+        if specialized_mode and (args.source != 'auto' or args.file_id is not None):
+            raise ValueError('--source saved / --file-id 不与搜索、历史版本命令混用。')
+        if specialized_mode and not args.name:
+            raise ValueError('搜索、历史版本命令必须提供 name。')
         if args.search:
             cmd_search(args)
         elif args.list_versions:
@@ -640,6 +800,10 @@ def main():
     except RuntimeError as e:
         # DataWorks API 返回的失败（鉴权、配额、接口报错等），给干净提示而非 traceback
         print(f"[DataWorks 接口出错] {e}", file=sys.stderr)
+        sys.exit(5)
+    except Exception as e:
+        # SDK 可把签名请求塞进异常文本；未知错误不打印原始异常/traceback。
+        print('[DataWorks 接口出错] ' + str(_saved_api_error('DataWorks', e)), file=sys.stderr)
         sys.exit(5)
 
 

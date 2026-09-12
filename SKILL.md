@@ -1,17 +1,17 @@
 ---
 name: maxcompute-query
-description: 使用辅助脚本探查 MaxCompute/ODPS 表并执行只读 SQL，以真实数据完成数仓取数排查、指标/分布/空值验证、既有任务 SQL 审查或修改验证、DataWorks 任务拉取与版本对比，以及 DI 同步任务和 UDF 溯源。用户提到 ODPS、MaxCompute、DataWorks、MAX_PT、ds 分区、dwd/dws/ads 表、线上任务 SQL 或数仓数据异常时使用；先探查再查询，绝不改数。纯 SQL 概念讲解、无线上数仓的方言改写或非 SQL 代码审查不使用。
+description: 探查 MaxCompute/ODPS 表并执行只读 SQL，审查和验证数仓任务，拉取 DataWorks 代码及版本，分析 DI 同步配置和 UDF。也用于 PyODPS3 保存态调试、执行状态与输出核对、traceback 和运行日志诊断；经用户授权可提交保存态代码快照运行。纯 SQL 概念讲解、离线方言改写和无关 Python 代码审查不使用。
 ---
 
-# MaxCompute 数仓排查取数
+# MaxCompute 数仓排查与 PyODPS3 调试
 
-帮助你把用户的自然语言排查诉求，转化为「探查表结构 → 写 MaxCompute SQL → 执行 → 读结果 → 解读」的闭环。所有数据库交互都通过辅助脚本 `scripts/mc_query.py` 完成——它封装了 ODPS 连接、只读校验和结果格式化，**不要自己另写连接代码**。
+帮助你把用户的自然语言排查诉求，转化为「探查表结构 → 写 MaxCompute SQL → 执行 → 读结果 → 解读」的闭环。SQL 取数通过 `scripts/mc_query.py` 完成，它封装了 ODPS 连接、只读校验和结果格式化，不另写连接代码。PyODPS3 保存态运行与日志收集使用 `scripts/debug_pyodps3.py`，复用既有环境凭证；用户仅提供日志时可离线分析。
 
 当用户只给了表名/任务名、没有贴出 SQL（如「看看 `dws_xxx` 这个任务有没有问题」「帮我改下 `xxx`」）时，先用 `scripts/fetch_task_sql.py <表名>` 主动把线上 SQL 拉下来，再进入审查/修改——别反过来问用户要 SQL。详见下文「拉取线上任务 SQL」。
 
 ## 核心原则
 
-**只读。** 脚本只跑 `SELECT/WITH/DESC/SHOW/EXPLAIN`，会拦截一切写操作。排查就是看数据，不改数据。如果用户的诉求确实需要写（建表、刷数、改数），明确告诉用户这超出本工具范围，而不是绕过校验。
+**区分 SQL 查询与任务运行。** `mc_query.py` 只跑 `SELECT/WITH/DESC/SHOW/EXPLAIN`，保留写操作拦截，不能把 SQL 写操作包装成 Python 绕过校验。PyODPS3 调试仅通过专用运行入口提交用户已授权的保存态代码快照；先核实实际写入表、分区及运行配置，已有授权覆盖时继续执行。节点名含 `test`、开发环境或曾获另一任务授权，都不等于当前脚本可随意写入。运行不修改保存态、不提交发布，不自动修复后重跑。
 
 **先探查，再动手。** 不要凭记忆或猜测写列名、表名。线上表多、命名长、字段杂，猜错就白跑一轮。先用脚本摸清现状再写正式 SQL。
 
@@ -26,6 +26,7 @@ description: 使用辅助脚本探查 MaxCompute/ODPS 表并执行只读 SQL，�
 - 规则覆盖 `CREATE/DROP/ALTER TABLE`、`INSERT` 目标、`FROM/JOIN` 引用，以及 `MAX_PT('表名')` 中的物理表名；注释中的可复制 SQL/DDL 示例也保持一致。
 - CTE 名称、子查询别名和 `A.column` 等字段引用不属于物理表名，不加前缀。辅助脚本的表名参数不等同于 SQL 文本，不按此规则机械改写。
 - 无前缀的 `tmp` 表解析到任务当前项目；本项目任务应在 `tst_mc_prod` 下执行。此规范不授权修改连接配置或执行 SQL 写操作。
+- 这是生成和修改 SQL 的本项目惯例；运行 PyODPS3 保存态时必须保留原文，不能为套用本规范改写脚本中的 SQL。诊断时结合平台实际连接项目及 SDK 的 `project=` 参数核实表归属。
 
 ## 什么时候停下来用提问框问用户
 
@@ -66,10 +67,10 @@ description: 使用辅助脚本探查 MaxCompute/ODPS 表并执行只读 SQL，�
 ### 三条铁律
 
 - **基于证据下结论，不要转述。** 子代理必须回传真实 SQL + 真实数字；你要拿这些证据自己推理、自己合并，而不是把「子代理说没问题」直接抛给用户。用真实数据佐证是这个 skill 的根本，别因为分工就丢了。
-- **只读不变量照旧。** 子代理执行只走 `mc_query.py`（只读校验）；`fetch_task_sql.py` 拉回的任务代码（含 `DROP/CREATE/INSERT`）只供阅读分析，永不执行。
+- **执行边界随委派范围传递。** SQL 验证子代理只走 `mc_query.py` 的只读校验；任务分析器默认只取码和分析。PyODPS3 运行由持有明确任务授权的编排者单次提交，不让多个子代理重复发起运行。取回的 SQL/DI 配置不能直接执行。
 - **子代理问不到用户，疑问由你替它问。** 子代理没有提问框这个渠道，所以它一旦撞上「数据判不了、取决于用户」的决策点（口径定义、改造取舍、多个都合理的候选），约定是**不硬猜**，而是框定成「带选项的待澄清项」回传（两个模板的交付结构里都留了这个字段）。你收到后，别把它的某个猜测当结论抛给用户——在给最终结论前，用 `AskUserQuestion` 替它问清再合并。不确定多半在子代理里冒出来，而只有你能弹提问框。
 
-## 三种入口
+## 四种入口
 
 进来先判断属于哪一类：
 
@@ -77,24 +78,26 @@ description: 使用辅助脚本探查 MaxCompute/ODPS 表并执行只读 SQL，�
 - **B. 审查既有 SQL 任务**：用户给了一段 MaxCompute/ODPS SQL（脚本/作业/`.sql`/`.txt`），或**只点名了某张表/任务**（如「看看 `dws_xxx` 有没有逻辑问题」），要你找逻辑漏洞、bug、口径错误，或解释结果为什么不对。只给名字没贴 SQL 时，**第一步先用 `fetch_task_sql.py` 把代码拉下来**。走「审查既有 SQL 任务」一节——核心是**别停在静态阅读，把能用数据验证的疑点真的查一遍**。
 - **C. 修改/重构既有 SQL 任务**：用户要你「把这个任务改成 X」（改唯一键/粒度、加去重、改 JOIN、增删字段、调口径）。同样，只点名了任务/表而没贴 SQL 时，**先用 `fetch_task_sql.py` 拉代码**。走「修改/重构既有 SQL 任务」一节——核心是**别闭眼改写，改前用数据核实前提、改后用数据验证结果**。
 
+- **D. PyODPS3 调试与日志诊断**：用户点名 PyODPS3 节点、要求运行保存态，或贴出脚本输出、traceback、执行日志时，读 [references/pyodps3_debugging.md](references/pyodps3_debugging.md)。只读日志即可解决时不发起运行；需要运行时冻结保存态，核实授权与运行配置，再通过 `debug_pyodps3.py` 提交一次并收集证据。脚本失败不自动改节点或重跑。
+
 > B 和 C 都是子代理的主场：先用**任务代码分析器**拉取+分析出疑点清单，再把每条疑点**并行**交给多个**验证器**取数证实/证伪（见上「并行与子代理」）。A 则视情况——多个独立指标才并行，单查询自己跑。
 
 ## 拉取线上任务 SQL
 
-当用户只给了表名/任务名而没贴 SQL 时，用 `scripts/fetch_task_sql.py` 直连 DataWorks 把代码拉下来。它按「产出表名」反查生产任务节点，所以直接传表名就行（任务文件名和表名不一致也能命中），优先返回生产态、取不到再退开发态。
+当用户只给了表名/任务名而没贴 SQL 时，用 `scripts/fetch_task_sql.py` 直连 DataWorks 把代码拉下来。默认按「产出表名」反查生产任务节点，所以直接传表名就行（任务文件名和表名不一致也能命中），优先返回生产态、取不到再退开发态。用户指定保存态时必须显式使用 `--source saved`，用 `--file-id` 精确选文件；保存态缺失不能回退生产态，详见 [references/fetch_task_sql.md](references/fetch_task_sql.md)。
 
-```bash
+```powershell
 # 取某张表/任务的完整 SQL（直接打印，可读取后审查/修改）
-python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py dws_com_sys_oa_archived_time_risk_wide_df
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/fetch_task_sql.py dws_com_sys_oa_archived_time_risk_wide_df
 
 # 名字记不全、或想确认是哪一个：先列候选再取
-python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py oa_archived --search
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/fetch_task_sql.py oa_archived --search
 
 # 需要留底/反复看时落盘
-python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --save 任务.sql
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --save 任务.sql
 ```
 
-**⚠ 拉回来的 SQL 是「审查/修改对象」，不是拿去跑的查询。** 任务代码里通常含 `DROP/CREATE/INSERT` 等写语句——它只供你阅读分析，**绝不要丢给 `mc_query.py` 执行**（会被只读校验拦下，本就不该这么用）。要验证其中的前提或结果时，**另写只读 `SELECT`** 走 `mc_query.py`。本节及下面拉到的历史版本、数据集成配置同理：**一律只读、不执行**。
+**⚠ 拉回来的 SQL 是「审查/修改对象」，不是拿去跑的查询。** 任务代码里通常含 `DROP/CREATE/INSERT` 等写语句——它只供你阅读分析，**绝不要丢给 `mc_query.py` 执行**（会被只读校验拦下，本就不该这么用）。要验证其中的前提或结果时，**另写只读 `SELECT`** 走 `mc_query.py`。本节及下面拉到的 SQL 历史版本、数据集成配置同理。PyODPS3 保存态运行走单独的 D 入口，不能将本节的自动生产/开发回退结果拿去运行。
 
 找不到（退出码 4）多半是表名拼错或不是这套环境的产出表：用 `--search` 看候选，或用 `mc_query.py list-tables <关键字>` 核对真实表名后重试。
 
@@ -107,7 +110,7 @@ python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --save 
 - **历史版本**：用户要看「上一版 / 两周前那版 / 最近改了什么 / 哪版引入回归」时，用 `--list-versions` 看时间线、`--get-version N` 取某版、`--diff A B` 看两版改动。
 - **数据集成离线同步任务**：拉回的可能不是 SQL 而是 DI 同步节点（`to_holo_..._di`，多为 MaxCompute→Hologres）；脚本会自动识别并解读出源/目标/写入模式/列映射，重点看列是否按位置错位。目标表在 Hologres（跨引擎），需改用 `holo-query` 核对。
 
-（两类拉回的代码/配置同样**只读不执行**，见上 ⚠。）
+（历史 SQL 和 DI 配置只供阅读分析，见上 ⚠；PyODPS3 使用保存态调试入口。）
 
 ## 审查既有 SQL 任务
 
@@ -153,33 +156,33 @@ python .claude/skills/maxcompute-query/scripts/fetch_task_sql.py dws_xxx --save 
 ### 2. 探查表结构
 用辅助脚本定位表、看清字段，再决定怎么写。常用命令：
 
-```bash
+```powershell
 # 按名字找表
-python .claude/skills/maxcompute-query/scripts/mc_query.py list-tables h3
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/mc_query.py list-tables h3
 
 # 看字段、类型、注释 + 分区字段（写 SQL 前必做）
-python .claude/skills/maxcompute-query/scripts/mc_query.py desc dwd_fran_dev_h3_base_info_df
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/mc_query.py desc dwd_fran_dev_h3_base_info_df
 
 # 看有哪些分区、最新是哪天
-python .claude/skills/maxcompute-query/scripts/mc_query.py partitions dwd_fran_dev_h3_base_info_df
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/mc_query.py partitions dwd_fran_dev_h3_base_info_df
 
 # 看真实数据长什么样（自动取最新分区采样几行）
-python .claude/skills/maxcompute-query/scripts/mc_query.py sample dwd_fran_dev_h3_base_info_df -n 5
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/mc_query.py sample dwd_fran_dev_h3_base_info_df -n 5
 ```
 
 `desc` 会告诉你分区字段叫什么（`ds`/`pt`/`dt` 等不一定）——这决定了 WHERE 怎么写。
 
 **遇到不认识的自定义函数（UDF/UDTF）时，先读它的实现，别当黑盒。** 审查/改造任务 SQL 时常碰到非内建函数调用（如 `greedy_session(...)`），光看调用点猜不出它在算什么——用 `func` 把注册信息（AS 类名 / USING 资源）和**实现源码**拉出来读。这同样是只读操作，不会执行函数本身：
 
-```bash
+```powershell
 # 名字记不全先按子串找
-python .claude/skills/maxcompute-query/scripts/mc_query.py list-functions greedy
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/mc_query.py list-functions greedy
 
 # 读 UDF 的注册信息 + Python 源码（Java UDF 是 jar 二进制，无源码可读，会标注）
-python .claude/skills/maxcompute-query/scripts/mc_query.py func greedy_session
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/mc_query.py func greedy_session
 
 # 只想看 USING 里某一个资源文件
-python .claude/skills/maxcompute-query/scripts/mc_query.py resource greedy_session.py
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/mc_query.py resource greedy_session.py
 ```
 
 ### 3. 编写 MaxCompute SQL
@@ -191,15 +194,15 @@ python .claude/skills/maxcompute-query/scripts/mc_query.py resource greedy_sessi
 ### 4. 执行
 短 SQL 直接行内执行；复杂 SQL 写到临时 `.sql` 文件再 `-f` 执行（更好读、可复用）：
 
-```bash
+```powershell
 # 行内
-python .claude/skills/maxcompute-query/scripts/mc_query.py sql -q "SELECT 区域性质, COUNT(*) cnt FROM tst_mc_prod.表 WHERE ds=MAX_PT('tst_mc_prod.表') GROUP BY 区域性质 ORDER BY cnt DESC"
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/mc_query.py sql -q "SELECT 区域性质, COUNT(*) cnt FROM tst_mc_prod.表 WHERE ds=MAX_PT('tst_mc_prod.表') GROUP BY 区域性质 ORDER BY cnt DESC"
 
 # 文件
-python .claude/skills/maxcompute-query/scripts/mc_query.py sql -f query.sql
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/mc_query.py sql -f query.sql
 
 # 需要交付给用户时落盘
-python .claude/skills/maxcompute-query/scripts/mc_query.py sql -f query.sql --save 排查结果.xlsx
+& 'D:\PythonVenv\Scripts\python.exe' .agents/skills/maxcompute-query/scripts/mc_query.py sql -f query.sql --save 排查结果.xlsx
 ```
 
 结果以 markdown 表格打印到 stdout，可直接阅读推理。执行后还会打印一行**运行元信息**（`instance_id` / 扫描输入量 / 输出行数 / 耗时 / logview），并对**漏分区过滤的分区表**给出告警（默认只告警；`--strict` 升级为拦截、`--allow-full-scan` 静音）。子代理需把 `instance_id` 原样回传，作为「确实跑过、扫了多少」的可核验证据。
@@ -218,4 +221,4 @@ SQL 执行失败时，脚本会打印一段清晰的报错（错误信息 + 出�
 不要只把表格丢回去。结合用户最初的排查目标，说明数据说明了什么、是否印证/排除了某个怀疑、下一步建议查什么。需要交付明细时用 `--save` 导出 Excel/CSV 并告知路径。
 
 ## 连接说明
-**AK/SK 只来自环境变量 `ALIYUN_ACCESS_KEY_ID` / `ALIYUN_ACCESS_KEY_SECRET`（回退 `ODPS_ACCESS_ID` / `ODPS_SECRET`），`scripts/config.py` 不含明文密钥**，只存非密钥的 project/endpoint 等环境配置（两个脚本共用的单一来源，可由 `config.example.py` 复制而来）。缺凭证时脚本会在连接前清晰报错。project/endpoint 同样可用 `ODPS_PROJECT/ODPS_ENDPOINT` 等环境变量覆盖，无需改代码。
+**AK/SK 只来自环境变量 `ALIYUN_ACCESS_KEY_ID` / `ALIYUN_ACCESS_KEY_SECRET`（回退 `ODPS_ACCESS_ID` / `ODPS_SECRET`），`scripts/config.py` 不含明文密钥**，只存非密钥的 project/endpoint 等环境配置（辅助脚本共用的单一来源，可由 `config.example.py` 复制而来）。缺凭证时脚本会在连接前清晰报错。project/endpoint 同样可用 `ODPS_PROJECT/ODPS_ENDPOINT` 等环境变量覆盖，无需改代码。
