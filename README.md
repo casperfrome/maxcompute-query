@@ -12,6 +12,12 @@ MaxCompute/ODPS 只读取数、DataWorks 任务审查和 PyODPS3 本地修复验
 
 SQL 查询通道保持只读。拉回的任务代码只供审查，不能直接执行或包装为 Python 绕过查询校验。PyODPS3 可能产生实际写入，先核实目标、分区、参数和授权，不能以 test/Dev 命名代替。代码只交付本地，不更新、保存、提交或发布原 DataWorks 节点。运行验证与业务数据验证分别报告。
 
+## SQL 运行、恢复和导出
+
+查询提交后立即在 stderr 输出实例 ID、项目和本地记录路径；默认等待 600 秒。超时不会取消云端查询，也不会自动重新提交。用 `sql --instance-id ID --project PROJECT` 继续等待读取原实例，`--wait-timeout` 可调整本次等待时间；恢复不重新执行 SQL。每次操作记录在当前目录 `.maxcompute-query-runs/`，已加入 Git 忽略；查询原文和完整 LogView 只留本地，展示信息脱敏。
+
+预览默认最多下载 200 行，可用 `--max-rows` 修改；它不等于完整结果，也不减少 SQL 扫描量。完整 CSV/XLSX 导出使用 `--save` 和 `--batch-size`（默认 10,000），核对总行数后才原子发布文件。Excel 超过 1,048,575 条数据行或 16,384 列时拒绝并提示 CSV；受限读取、未知总量和中途中断不会生成“完整导出”。零结果保留表头。命令与状态说明见 [查询参考](references/maxcompute_sql.md#查询实例恢复与完整导出)。
+
 ## 配置与依赖
 
 本项目路径为 `D:\AllForCareer\数仓问题排查\.agents\skills\maxcompute-query`，Python 固定为 `D:\PythonVenv\Scripts\python.exe -X utf8 -B`。PowerShell 文本操作使用 UTF-8。已有环境版本记录在 [requirements-runtime.txt](requirements-runtime.txt) 与 [requirements-test.txt](requirements-test.txt)；仅需要复现环境时按指定环境管理依赖，不为离线检查升级 SDK。
@@ -25,6 +31,7 @@ SQL 查询通道保持只读。拉回的任务代码只供审查，不能直接�
 | 文件 | 用途 |
 |---|---|
 | [mc_query.py](scripts/mc_query.py) | 查询、分区检查、导出与 UDF 读取 |
+| [sql_execution.py](scripts/sql_execution.py) | 实例追踪与恢复、有界预览、流式完整导出 |
 | [fetch_task_sql.py](scripts/fetch_task_sql.py) | 代码、版本、精确 file/node 选择 |
 | [build_validation_sql.py](scripts/build_validation_sql.py) | 离线 inline/compare/变量清点 |
 | [debug_pyodps3.py](scripts/debug_pyodps3.py) | 日志、保存态与单次调试 |

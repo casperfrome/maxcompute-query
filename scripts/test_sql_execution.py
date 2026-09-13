@@ -532,6 +532,19 @@ import sql_execution
             self.assertEqual(reader.batch_calls, [])
             self.assertEqual(output.read_bytes(), b'original')
 
+    def test_excel_exact_limits_are_allowed(self):
+        from openpyxl import load_workbook
+        output = self.root / 'boundary.xlsx'
+        reader = Reader(count=3, columns=('a', 'b'))
+        with patch.object(self.backend, 'XLSX_MAX_DATA_ROWS', 3), patch.object(self.backend, 'XLSX_MAX_COLUMNS', 2):
+            _, meta = self.execute(Client(Instance(reader)), save=output, batch_size=2)
+        workbook = load_workbook(output, read_only=True)
+        try:
+            self.assertEqual(list(workbook.active.values), [('a', 'b'), (0, 0), (1, 1), (2, 2)])
+        finally:
+            workbook.close()
+        self.assertEqual(meta['downloaded_rows'], 3)
+
     def test_xlsx_long_cell_fails_instead_of_silent_truncation(self):
         output = self.root / 'data.xlsx'
         reader = Reader(count=1, batches=[pd.DataFrame({'value': ['x' * 32768]})])

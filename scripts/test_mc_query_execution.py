@@ -111,3 +111,37 @@ def test_empty_file_argument_is_a_local_input_error(monkeypatch):
     args = m.build_parser().parse_args(['sql', '-f', ''])
     with pytest.raises((ValueError, OSError)):
         m.cmd_sql(args)
+
+
+def test_cli_backend_preview_then_resume_export_same_instance(tmp_path, monkeypatch, capsys):
+    from test_sql_execution import Client, Instance, Reader
+    client = Client(Instance(Reader(count=7)))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(m, 'get_odps', lambda **kw: client)
+    parser = m.build_parser()
+    m.cmd_sql(parser.parse_args(['sql', '-q', 'SELECT 1', '--max-rows', '2']))
+    shown = capsys.readouterr()
+    assert '预览行数: 2' in shown.out and '总行数=7' in shown.err
+    assert 'instance-123' in shown.err and 'private-signature' not in shown.err
+    output = tmp_path / 'complete.csv'
+    m.cmd_sql(parser.parse_args(['sql', '--instance-id', 'instance-123', '--project', 'project_a',
+        '--save', str(output), '--batch-size', '3']))
+    shown = capsys.readouterr()
+    assert shown.out == '' and '已完整导出 7 行' in shown.err
+    assert output.read_text(encoding='utf-8-sig').splitlines() == ['value', *map(str, range(7))]
+    assert client.submissions == ['SELECT 1']
+    assert len(list((tmp_path / '.maxcompute-query-runs').glob('*/state.json'))) == 2
+
+
+def test_cli_timeout_exit_code_preserves_same_instance(tmp_path, monkeypatch, capsys):
+    from test_sql_execution import Client, WaitTimeoutError
+    client = Client()
+    client.instance.wait_error = WaitTimeoutError('wait expired')
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(m, 'get_odps', lambda **kw: client)
+    args = m.build_parser().parse_args(['sql', '-q', 'SELECT 1'])
+    with pytest.raises(SystemExit) as error:
+        m.cmd_sql(args)
+    assert error.value.code == 5 and client.submissions == ['SELECT 1']
+    text = capsys.readouterr()
+    assert text.out == '' and '--instance-id' in text.err and 'instance-123' in text.err
