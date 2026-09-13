@@ -44,7 +44,7 @@ def require_credentials():
         raise ValueError('缺少环境凭证：设置 ALIYUN_ACCESS_KEY_ID / ALIYUN_ACCESS_KEY_SECRET，或 ODPS_ACCESS_ID / ODPS_SECRET。')
 
 
-def validate_connection(service='odps'):
+def validate_connection(service='odps', *, project=None):
     if service not in ('odps', 'dataworks'):
         raise ValueError('未知连接类型。')
     require_credentials()
@@ -52,7 +52,7 @@ def validate_connection(service='odps'):
         'DATAWORKS_ENDPOINT', 'DATAWORKS_PROJECT_ID')
     invalid = []
     for name in names:
-        value = globals()[name]
+        value = project if name == 'ODPS_PROJECT' and project is not None else globals()[name]
         if name == 'DATAWORKS_PROJECT_ID':
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 invalid.append(name)

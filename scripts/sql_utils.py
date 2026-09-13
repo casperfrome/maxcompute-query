@@ -495,3 +495,103 @@ def partition_constrained(query, scope, relation, column, start, end, project=No
         if tokens[i].text in ('=', '<', '<=', '>', '>=') and value(start, i):
             return column_end(i + 1, end) == end
     return False
+
+# ---------------------------------------------------------------------------
+# 只读校验
+# ---------------------------------------------------------------------------
+# 真正的只读保证来自两道结构性检查：① 单语句（按 ; 切分，多于一条直接拒）② 首词必须是
+# 只读词。下面这份写动词黑名单只是纵深防御，它唯一不可或缺的价值是堵
+# `WITH cte AS (...) INSERT OVERWRITE ...` 这种「首词是 WITH、语句体却在写」的向量——
+# 所以 INSERT 等真实写动词必须保留。反过来，它不该误伤和写动词同名的函数/列名：
+# 像字符串函数 REPLACE(...)，或对安全零贡献、却易撞到列名的 SET/USE/ADD/LOAD/COPY/WRITE
+# （后者要么只能作首词被①②拦下、要么撞到普通标识符），都不该进这份名单。
+WRITE_KEYWORDS = [
+    "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "TRUNCATE",
+    "MERGE", "RENAME", "GRANT", "REVOKE", "UNLOAD", "MSCK", "PURGE", "RESTORE",
+]
+# 允许的首关键字（语句必须以其一开头）
+READ_STARTERS = ["SELECT", "WITH", "DESC", "DESCRIBE", "SHOW", "EXPLAIN", "READ"]
+
+
+def _scrub_for_check(sql: str) -> str:
+    """单遍扫描：去注释 + 抹空字符串字面量与反引号标识符内容，供只读校验切分/查词用。
+
+    只用于只读校验；真正执行用的是原始 SQL。这里只为「看清结构、不被串内字符或保留字
+    列名误导」：注释抹成空格，字符串/反引号内容抹空，而 ; 括号 关键字等结构原样保留，
+    所以拦截写操作的能力不变。
+
+    为什么要单遍：两遍正则（先去注释 vs 先屏蔽串）都切不对——串里可能含 -- 或 /* */，
+    注释里可能含引号。一次走完、带状态地处理，才能同时正确应对
+    `remark='a--b'`（串内注释符）、`/* it's fine */ SELECT ...`（注释内引号）、
+    以及 `update`/`set` 这类反引号引用的保留字列名。
+    """
+    out, i, n = [], 0, len(sql)
+    while i < n:
+        two = sql[i:i + 2]
+        if two == "--":                      # 行注释 → 抹到行尾
+            j = sql.find("\n", i)
+            if j == -1:
+                break
+            out.append(" ")
+            i = j
+            continue
+        if two == "/*":                      # 块注释 → 抹掉
+            j = sql.find("*/", i + 2)
+            out.append(" ")
+            i = n if j == -1 else j + 2
+            continue
+        c = sql[i]
+        if c in "'\"":                       # 字符串字面量 → 抹空（处理 \ 转义与 '' 双写）
+            q = c
+            out.append(q)
+            i += 1
+            while i < n:
+                if sql[i] == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if sql[i] == q:
+                    if q == "'" and sql[i + 1:i + 2] == "'":
+                        i += 2          # MaxCompute 用 '' 表示一个单引号
+                        continue
+                    break
+                i += 1
+            out.append(q)
+            i += 1
+            continue
+        if c == "`":                         # 反引号标识符（保留字列名如 `update`）→ 抹空
+            out.append("`")
+            i += 1
+            while i < n and sql[i] != "`":
+                i += 1
+            out.append("`")
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out).strip()
+
+
+def assert_readonly(sql: str) -> None:
+    """只读校验：不通过则抛 ValueError。"""
+    scrubbed = _scrub_for_check(sql)
+    if not scrubbed:
+        raise ValueError("SQL 为空。")
+
+    # 只支持单条语句，避免 "SELECT ...; DROP ..." 绕过
+    statements = [s for s in (scrubbed.rstrip(";").split(";")) if s.strip()]
+    if len(statements) > 1:
+        raise ValueError("一次只允许执行一条 SQL 语句（检测到多条，可能含写操作）。")
+
+    upper = scrubbed.upper()
+    first_word = re.match(r"^\s*([A-Z]+)", upper)
+    if not first_word or first_word.group(1) not in READ_STARTERS:
+        raise ValueError(
+            f"只允许只读查询（{'/'.join(READ_STARTERS)}）。检测到的起始关键字："
+            f"{first_word.group(1) if first_word else '<空>'}"
+        )
+
+    for kw in WRITE_KEYWORDS:
+        # KEYWORD( 是函数调用（如 TRUNCATE(x)），不算写语句；真正的写语句形如
+        # KEYWORD <空格> ...（如 INSERT OVERWRITE、DROP TABLE），用负向预查区分二者。
+        if re.search(r"\b" + kw + r"\b(?!\s*\()", upper):
+            raise ValueError(f"检测到写操作关键字 `{kw}`，已拒绝执行（本工具仅只读）。")

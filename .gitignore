@@ -1,4 +1,4 @@
-# 含真实阿里云凭证，禁止提交。请复制 scripts/config.example.py 为 scripts/config.py 后填入凭证。
+# 本地非密钥配置不提交；密钥仅来自环境变量。
 scripts/config.py
 
 # Python
@@ -29,3 +29,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# 本地查询原文、实例恢复与结果读取记录
+.maxcompute-query-runs/

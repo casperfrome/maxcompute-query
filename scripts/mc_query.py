@@ -28,7 +28,7 @@ import argparse
 import os
 import re
 import sys
-import time
+from pathlib import Path
 import warnings
 
 warnings.filterwarnings(
@@ -48,111 +48,11 @@ except Exception:
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import runtime_config as config  # noqa: E402
-from sql_utils import Query, mask_literals as _mask_literals, partition_constrained, tokenize
+from sql_utils import (Query, mask_literals as _mask_literals, partition_constrained, tokenize,
+                       assert_readonly, _scrub_for_check, WRITE_KEYWORDS, READ_STARTERS)
 
 # 打印结果时的默认行数上限（保护超大结果集，可用 --max-rows 调整）
 DEFAULT_MAX_PRINT_ROWS = 200
-
-# ---------------------------------------------------------------------------
-# 只读校验
-# ---------------------------------------------------------------------------
-# 真正的只读保证来自两道结构性检查：① 单语句（按 ; 切分，多于一条直接拒）② 首词必须是
-# 只读词。下面这份写动词黑名单只是纵深防御，它唯一不可或缺的价值是堵
-# `WITH cte AS (...) INSERT OVERWRITE ...` 这种「首词是 WITH、语句体却在写」的向量——
-# 所以 INSERT 等真实写动词必须保留。反过来，它不该误伤和写动词同名的函数/列名：
-# 像字符串函数 REPLACE(...)，或对安全零贡献、却易撞到列名的 SET/USE/ADD/LOAD/COPY/WRITE
-# （后者要么只能作首词被①②拦下、要么撞到普通标识符），都不该进这份名单。
-WRITE_KEYWORDS = [
-    "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "TRUNCATE",
-    "MERGE", "RENAME", "GRANT", "REVOKE", "UNLOAD", "MSCK", "PURGE", "RESTORE",
-]
-# 允许的首关键字（语句必须以其一开头）
-READ_STARTERS = ["SELECT", "WITH", "DESC", "DESCRIBE", "SHOW", "EXPLAIN", "READ"]
-
-
-def _scrub_for_check(sql: str) -> str:
-    """单遍扫描：去注释 + 抹空字符串字面量与反引号标识符内容，供只读校验切分/查词用。
-
-    只用于只读校验；真正执行用的是原始 SQL。这里只为「看清结构、不被串内字符或保留字
-    列名误导」：注释抹成空格，字符串/反引号内容抹空，而 ; 括号 关键字等结构原样保留，
-    所以拦截写操作的能力不变。
-
-    为什么要单遍：两遍正则（先去注释 vs 先屏蔽串）都切不对——串里可能含 -- 或 /* */，
-    注释里可能含引号。一次走完、带状态地处理，才能同时正确应对
-    `remark='a--b'`（串内注释符）、`/* it's fine */ SELECT ...`（注释内引号）、
-    以及 `update`/`set` 这类反引号引用的保留字列名。
-    """
-    out, i, n = [], 0, len(sql)
-    while i < n:
-        two = sql[i:i + 2]
-        if two == "--":                      # 行注释 → 抹到行尾
-            j = sql.find("\n", i)
-            if j == -1:
-                break
-            out.append(" ")
-            i = j
-            continue
-        if two == "/*":                      # 块注释 → 抹掉
-            j = sql.find("*/", i + 2)
-            out.append(" ")
-            i = n if j == -1 else j + 2
-            continue
-        c = sql[i]
-        if c in "'\"":                       # 字符串字面量 → 抹空（处理 \ 转义与 '' 双写）
-            q = c
-            out.append(q)
-            i += 1
-            while i < n:
-                if sql[i] == "\\" and i + 1 < n:
-                    i += 2
-                    continue
-                if sql[i] == q:
-                    if q == "'" and sql[i + 1:i + 2] == "'":
-                        i += 2          # MaxCompute 用 '' 表示一个单引号
-                        continue
-                    break
-                i += 1
-            out.append(q)
-            i += 1
-            continue
-        if c == "`":                         # 反引号标识符（保留字列名如 `update`）→ 抹空
-            out.append("`")
-            i += 1
-            while i < n and sql[i] != "`":
-                i += 1
-            out.append("`")
-            i += 1
-            continue
-        out.append(c)
-        i += 1
-    return "".join(out).strip()
-
-
-def assert_readonly(sql: str) -> None:
-    """只读校验：不通过则抛 ValueError。"""
-    scrubbed = _scrub_for_check(sql)
-    if not scrubbed:
-        raise ValueError("SQL 为空。")
-
-    # 只支持单条语句，避免 "SELECT ...; DROP ..." 绕过
-    statements = [s for s in (scrubbed.rstrip(";").split(";")) if s.strip()]
-    if len(statements) > 1:
-        raise ValueError("一次只允许执行一条 SQL 语句（检测到多条，可能含写操作）。")
-
-    upper = scrubbed.upper()
-    first_word = re.match(r"^\s*([A-Z]+)", upper)
-    if not first_word or first_word.group(1) not in READ_STARTERS:
-        raise ValueError(
-            f"只允许只读查询（{'/'.join(READ_STARTERS)}）。检测到的起始关键字："
-            f"{first_word.group(1) if first_word else '<空>'}"
-        )
-
-    for kw in WRITE_KEYWORDS:
-        # KEYWORD( 是函数调用（如 TRUNCATE(x)），不算写语句；真正的写语句形如
-        # KEYWORD <空格> ...（如 INSERT OVERWRITE、DROP TABLE），用负向预查区分二者。
-        if re.search(r"\b" + kw + r"\b(?!\s*\()", upper):
-            raise ValueError(f"检测到写操作关键字 `{kw}`，已拒绝执行（本工具仅只读）。")
-
 
 # ---------------------------------------------------------------------------
 # 分区过滤静态检查：绑定每次关系引用及其作用域；失败显式返回未知。
@@ -202,115 +102,83 @@ def check_partition_filters(odps, sql):
 # ---------------------------------------------------------------------------
 # ODPS 连接 & 取数
 # ---------------------------------------------------------------------------
-def get_odps() -> ODPS:
-    config.validate_connection('odps')
+def get_odps(project=None) -> ODPS:
+    config.validate_connection('odps', project=project)
     from odps import ODPS
     return ODPS(
         access_id=config.ACCESS_ID,
         secret_access_key=config.SECRET,
-        project=config.ODPS_PROJECT,
+        project=(config.ODPS_PROJECT if project is None else project).strip(),
         endpoint=config.ODPS_ENDPOINT,
         tunnel_endpoint=config.ODPS_TUNNEL_ENDPOINT,
     )
 
 
 def _safe(fn):
-    """跑一个可能失败的取元信息动作，失败就返回 None（元信息是锦上添花，不该拖垮主流程）。"""
+    """Optional UDF metadata must not prevent reading the available source."""
     try:
         return fn()
     except Exception:
         return None
 
 
-def _input_bytes_human(inst) -> str:
-    """best-effort 从 task summary 的 Inputs 抠出扫描输入字节数（各输入分区字节求和），转人类可读。
-
-    Inputs 形如 {'proj.table/ds=20260620': [行数, 字节数, ...], ...}——取每项的第 2 个元素求和。
-    取不到/解析不了返回 None（元信息是锦上添花，绝不拖垮主流程）。
-    """
-    def _compute():
-        names = inst.get_task_names()
-        summary = inst.get_task_summary(names[0])
-        inputs = dict(summary).get("Inputs") or {}
-        total = sum(v[1] for v in inputs.values() if isinstance(v, (list, tuple)) and len(v) > 1)
-        return total
-
-    total = _safe(_compute)
-    if not total:
-        return None
-    n = float(total)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return f"{n:.1f}{unit}"
-        n /= 1024
-
-
-def run_select_df(odps: ODPS, sql: str):
-    """执行只读 SQL，返回 (DataFrame, meta)。meta 含 instance_id/行数/耗时/logview/扫描量，
-    供调用方打印「运行元信息」——让子代理回传的结论可被核验（确属真跑、扫了多少）。出错时抛 ODPSError。"""
-    assert_readonly(sql)
-    t0 = time.time()
-    inst = odps.execute_sql(sql)
-    with inst.open_reader(tunnel=True) as reader:
-        df = reader.to_pandas(n_process=8)
-    meta = {
-        "instance_id": getattr(inst, "id", None),
-        "rows": len(df),
-        "elapsed_s": round(time.time() - t0, 1),
-        "logview": _safe(lambda: inst.get_logview_address()),
-        "scanned": _input_bytes_human(inst),
-    }
-    return df, meta
+def run_select_df(odps: ODPS, sql: str = None, **options):
+    """Compatibility entry: bounded preview, raw text, or streamed export + metadata."""
+    from sql_execution import execute_query
+    return execute_query(odps, sql=sql, **options)
 
 
 def format_run_meta(meta: dict) -> str:
-    """把 meta 拼成一行紧凑的「运行元信息」footer。"""
-    parts = [f"instance_id={meta.get('instance_id')}"]
-    if meta.get("scanned"):
+    """Never label downloaded rows as the remote result's total size."""
+    def value(key):
+        item = meta.get(key)
+        return '未知' if item is None else str(item)
+    def flag(key):
+        item = meta.get(key)
+        return '未知' if item is None else '是' if item else '否'
+    parts = [f"instance_id={value('instance_id')}", f"project={value('project')}",
+             f"状态={value('state')}", f"总行数={value('total_rows')}",
+             f"下载行数={value('downloaded_rows')}", f"展示行数={value('displayed_rows')}",
+             f"截断={flag('truncated')}", f"受限={flag('restricted')}", f"耗时={value('elapsed_s')}s"]
+    if meta.get('scanned') is not None:
         parts.append(f"扫描输入≈{meta['scanned']}")
-    parts.append(f"输出行数={meta.get('rows')}")
-    parts.append(f"耗时={meta.get('elapsed_s')}s")
-    if meta.get("logview"):
-        parts.append(f"logview={meta['logview']}")
-    return "-- 运行元信息: " + " | ".join(parts)
+    if meta.get('run_dir'):
+        parts.append(f"记录={meta['run_dir']}")
+    # LogView is a signed URL. Complete address stays in the local state record.
+    if meta.get('logview'):
+        parts.append('LogView=见本地记录')
+    from pyodps3_runtime import redact
+    return redact('-- 运行元信息: ' + ' | '.join(parts))
 
 
-def execute_or_report(odps: ODPS, sql: str):
-    """执行 SQL；若 MaxCompute 返回错误，打印干净、可据此修正的错误信息并以退出码 4 退出。
-
-    这样调用方（写 SQL 的 Claude）看到的是结构化的报错+出错 SQL，而不是一坨
-    Python traceback，便于读懂错误、自己改 SQL 再重试。返回 (DataFrame, meta)。
-    """
-    from odps.errors import ODPSError
+def execute_or_report(odps: ODPS, sql: str = None, **options):
+    from sql_execution import ExecutionError
     try:
-        return run_select_df(odps, sql)
-    except ODPSError as e:
-        print("[SQL 执行失败]", file=sys.stderr)
-        print(f"错误信息: {e}", file=sys.stderr)
-        print("出错的 SQL:", file=sys.stderr)
-        print(sql.strip(), file=sys.stderr)
-        print(
-            "\n提示: 请根据上面的错误修改 SQL 后重试（常见原因与改法见 "
-            "references/maxcompute_sql.md 的『常见报错对照』；列名/表名不确定时先用 desc/list-tables 核对）。",
-            file=sys.stderr,
-        )
-        sys.exit(4)
+        return run_select_df(odps, sql, **options)
+    except ExecutionError as error:
+        from pyodps3_runtime import redact
+        print('[查询未完成] ' + redact(str(error)), file=sys.stderr)
+        print(format_run_meta(error.meta), file=sys.stderr)
+        raise SystemExit(error.exit_code) from None
 
 
 def df_to_markdown(df, max_rows: int) -> str:
-    total = len(df)
     shown = df.head(max_rows)
     try:
         table = shown.to_markdown(index=False)
     except Exception:
-        # 没装 tabulate 时退回到普通字符串表格
         table = shown.to_string(index=False)
-    note = ""
-    if total > max_rows:
-        note = f"\n\n（结果共 {total} 行，仅显示前 {max_rows} 行；如需全部请用 --save 落盘）"
-    elif total == 0:
-        note = "\n（查询返回 0 行）"
-    return table + note + (f"\n\n行数: {total}" if total else "")
+    return table + f"\n\n预览行数: {len(shown)}（远端总量见运行元信息）"
+
+
+def _print_query_result(data, meta, max_rows):
+    if isinstance(data, str):
+        print(data)
+    elif data is not None:
+        print(df_to_markdown(data, max_rows=max_rows))
+    if meta.get('output_path'):
+        print(f"已完整导出 {meta.get('downloaded_rows')} 行至 {meta['output_path']}", file=sys.stderr)
+    print(format_run_meta(meta), file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +253,8 @@ def cmd_partitions(args):
 
 
 def cmd_sample(args):
-    odps = get_odps()
+    project = getattr(args, 'project', None)
+    odps = get_odps(project=project) if project is not None else get_odps()
     table = args.table
     if not odps.exist_table(table):
         print(f"表不存在：{table}", file=sys.stderr)
@@ -397,10 +266,9 @@ def cmd_sample(args):
         sql = f"SELECT * FROM {table} WHERE {pcol}=MAX_PT('{table}') LIMIT {n}"
     else:
         sql = f"SELECT * FROM {table} LIMIT {n}"
-    print(f"-- 采样 SQL: {sql}\n")
-    df, meta = execute_or_report(odps, sql)
-    print(df_to_markdown(df, max_rows=n))
-    print("\n" + format_run_meta(meta))
+    print(f"-- 采样 SQL: {sql}", file=sys.stderr)
+    data, meta = execute_or_report(odps, sql, max_rows=n, wait_timeout=getattr(args, "wait_timeout", 600))
+    _print_query_result(data, meta, n)
 
 
 # ---------------------------------------------------------------------------
@@ -547,55 +415,54 @@ def _save_sources(path, text_sources, code):
 
 
 def cmd_sql(args):
-    if bool(args.query) == bool(args.file):
-        print("请用 -q \"<sql>\" 或 -f <file.sql> 二选一提供 SQL。", file=sys.stderr)
-        sys.exit(2)
-
-    if args.file:
-        with open(args.file, encoding="utf-8") as f:
-            sql = f.read()
-    else:
-        sql = args.query
-
-    try:
+    instance_id = getattr(args, 'instance_id', None)
+    if sum(value is not None for value in (args.query, args.file, instance_id)) != 1:
+        raise ValueError('请用 -q、-f 或 --instance-id 三选一提供查询或恢复标识。')
+    if args.save is not None and Path(args.save).suffix.lower() not in ('.csv', '.xlsx'):
+        raise ValueError('--save 只支持 .csv 或 .xlsx')
+    sql = None
+    if instance_id is None:
+        sql = Path(args.file).read_text(encoding='utf-8-sig') if args.file is not None else args.query
         assert_readonly(sql)
-    except ValueError as e:
-        print(f"[只读校验未通过] {e}", file=sys.stderr)
-        sys.exit(3)
-
-    odps = get_odps()
-
-    # 分区过滤静态体检（痛点 4）：默认只告警，不拦截；--strict 升级为拦截，--allow-full-scan 静音。
-    if not args.allow_full_scan:
-        warns = check_partition_filters(odps, sql)
-        if warns:
-            print("[分区过滤告警] 以下关系的分区过滤缺失或未知，可能触发全表扫描：",
-                  file=sys.stderr)
-            for issue in warns:
+    project = getattr(args, 'project', None)
+    odps = get_odps(project=project) if project is not None else get_odps()
+    # Recovery reads an already-submitted instance; never rebuild or resubmit its SQL.
+    if sql is not None and not args.allow_full_scan:
+        issues = check_partition_filters(odps, sql)
+        if issues:
+            print('[分区过滤告警] 以下关系的分区过滤缺失或未知：', file=sys.stderr)
+            for issue in issues:
                 detail = f"，缺过滤 {issue['missing']}" if issue['missing'] else ''
                 print(f"  - {issue['table']}：{issue['status']}，{issue['reason']}{detail}", file=sys.stderr)
             if args.strict:
-                print("[--strict] 存在分区过滤告警，已拒绝执行。确认要全表扫描请加 --allow-full-scan。",
-                      file=sys.stderr)
-                sys.exit(3)
-
-    df, meta = execute_or_report(odps, sql)
-
-    if args.save:
-        out = args.save
-        if out.lower().endswith(".csv"):
-            df.to_csv(out, index=False, encoding="utf-8-sig")
-        else:
-            df.to_excel(out, index=False)
-        print(f"已保存 {len(df)} 行至 {out}")
-    else:
-        print(df_to_markdown(df, max_rows=args.max_rows))
-    print("\n" + format_run_meta(meta))
+                print('[--strict] 已拒绝执行。确认全扫描范围后可显式使用 --allow-full-scan。', file=sys.stderr)
+                raise SystemExit(3)
+    data, meta = execute_or_report(odps, sql, instance_id=instance_id, max_rows=args.max_rows,
+        wait_timeout=getattr(args, 'wait_timeout', 600), save=args.save,
+        batch_size=getattr(args, 'batch_size', 10000))
+    _print_query_result(data, meta, args.max_rows)
 
 
 # ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
+def nonempty(value):
+    text = value.strip()
+    if not text:
+        raise argparse.ArgumentTypeError('标识不能为空')
+    return text
+
+
+def positive_integer(value):
+    try:
+        number = int(value)
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError('需要正整数') from None
+    if number <= 0:
+        raise argparse.ArgumentTypeError('需要正整数')
+    return number
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         description="MaxCompute 数仓排查取数辅助工具（只读）",
@@ -617,7 +484,9 @@ def build_parser():
 
     sp = sub.add_parser("sample", help="按最新分区采样几行")
     sp.add_argument("table")
-    sp.add_argument("-n", type=int, default=10, help="采样行数，默认 10")
+    sp.add_argument("-n", type=positive_integer, default=10, help="采样行数，默认 10")
+    sp.add_argument("--project", type=nonempty, help="本次项目；默认配置项目")
+    sp.add_argument("--wait-timeout", type=positive_integer, default=600, help="查询等待秒数，默认 600；超时不取消")
     sp.set_defaults(func=cmd_sample)
 
     sp = sub.add_parser("list-functions", help="列出自定义函数 UDF（可按名称子串过滤）")
@@ -638,8 +507,12 @@ def build_parser():
     g = sp.add_mutually_exclusive_group(required=True)
     g.add_argument("-q", "--query", help="行内 SQL")
     g.add_argument("-f", "--file", help="SQL 文件路径")
+    g.add_argument("--instance-id", type=nonempty, help="恢复指定实例；不提交新 SQL")
+    sp.add_argument("--project", type=nonempty, help="本次提交或恢复所属项目；默认配置项目")
+    sp.add_argument("--wait-timeout", type=positive_integer, default=600, help="查询等待秒数，默认 600；超时不取消")
+    sp.add_argument("--batch-size", type=positive_integer, default=10000, help="完整导出每批行数，默认 10000")
     sp.add_argument("--save", help="落盘路径（.csv 或 .xlsx）")
-    sp.add_argument("--max-rows", type=int, default=DEFAULT_MAX_PRINT_ROWS,
+    sp.add_argument("--max-rows", type=positive_integer, default=DEFAULT_MAX_PRINT_ROWS,
                     help=f"打印行数上限，默认 {DEFAULT_MAX_PRINT_ROWS}")
     sp.add_argument("--strict", action="store_true",
                     help="把分区过滤告警升级为硬拦截（默认只告警不拦截）")
@@ -655,9 +528,13 @@ def main():
     args = parser.parse_args()
     try:
         args.func(args)
-    except ValueError as e:
-        print(f"[错误] {e}", file=sys.stderr)
+    except (ValueError, OSError) as e:
+        from pyodps3_runtime import redact
+        print(f"[错误] {redact(str(e))}", file=sys.stderr)
         sys.exit(3)
+    except KeyboardInterrupt:
+        print("[已停止本地操作] 未自动取消或重新提交；请按上方记录恢复或先核实提交状态。", file=sys.stderr)
+        sys.exit(130)
 
 
 if __name__ == "__main__":

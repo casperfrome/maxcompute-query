@@ -201,7 +201,7 @@ def test_strict_partition_blocks_before_execution(monkeypatch, capsys, query, st
 def test_default_warning_and_explicit_fullscan_preserve_execution(monkeypatch, strict, fullscan):
     monkeypatch.setattr(m, 'get_odps', lambda: Tables())
     calls = []
-    monkeypatch.setattr(m, 'execute_or_report', lambda *args: (calls.append(args) or object(), {}))
+    monkeypatch.setattr(m, 'execute_or_report', lambda *args, **kwargs: (calls.append(args) or object(), {}))
     monkeypatch.setattr(m, 'df_to_markdown', lambda *args, **kw: 'empty valid result')
     monkeypatch.setattr(m, 'format_run_meta', lambda *_: 'mock')
     args = NS(query='SELECT * FROM p.t', file=None, allow_full_scan=fullscan, strict=strict, save=None, max_rows=10)
